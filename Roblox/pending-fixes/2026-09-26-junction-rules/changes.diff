@@ -1,0 +1,305 @@
+--- a/NPCDriverService
++++ b/NPCDriverService
+@@ -74,6 +74,12 @@
+ -- car the traffic rules cannot explain (see waitingInTraffic) counts as bugged, and only a
+ -- bugged car is pushed through or removed.
+ local IMPATIENCE_TIME   = 6    -- s a car waits for a gap at a junction before it noses out (never into a full exit or across a car in the box)
++local AT_LINE_DIST      = 2    -- studs short of its stop line a car counts as waiting at it
++-- Turn-taking at junctions WITHOUT signals: how long a car waits at its line before it may
++-- take its turn (and approaching cross traffic lets it in). Roads of equal priority take turns
++-- like an all-way stop; a side road meeting a main road waits longer, but always gets in.
++local TURN_WAIT_EQUAL   = 2
++local TURN_WAIT_MINOR   = 5
+ local SIGNAL_FAULT_TIME = 180  -- s of one unbroken red before the signal counts as broken (no working cycle is this long)
+ local CONNECTOR_STANDOFF_ESCAPE = 4  -- s two cars blocking EACH OTHER wait before one of them creeps through
+ local RESCUE_CLEAR_DIST = 30 * WS    -- studs a rescued (bugged) car must cover before it obeys traffic again
+@@ -115,6 +121,8 @@
+ -- Lane-change occupants by lane: cars mid-move (under BOTH lanes) and cars waiting to merge
+ -- (under the lane they want). Rebuilt with the other indexes every tick.
+ local _laneChangeIndex: { [string]: { any } } = {}
++-- Cars crossing a junction (or a join), by the lane they left: see getNearestQueueLeader.
++local _connectorByFromEdgeIndex: { [string]: { any } } = {}
+ local _edgeCongestion: { [string]: number } = {}
+ local _lastCongestionUpdate = 0
+ 
+@@ -138,6 +146,7 @@
+ 	currentSpeed: number?, -- Keeps track of smoothed speed for fluid acceleration/deceleration
+ 	vehicleClass: VehicleTypes.VehicleClass,
+ 	blockedTime:  number?, -- seconds spent yielding at the current junction (drives impatience)
++	waitSince:    number?, -- _simClock when this wait at the line began (orders turns at the junction)
+ 	stuckTime:    number?, -- seconds stopped at a junction for ANY reason (jam readouts)
+ 	redTime:      number?, -- seconds of the current unbroken red (drives SIGNAL_FAULT_TIME)
+ 	connSpeedCap: number?, -- max speed through the current connector (set from its tightest bend)
+@@ -187,6 +196,8 @@
+ -- MEMORY LEAK FIX: We make _drivers a WEAK-KEYED table so that when an NPC model is 
+ -- destroyed, its driver state is auto-garbage-collected, preventing a slow memory leak.
+ local _drivers: { [Model]: DriverState } = setmetatable({}, { __mode = "k" }) :: any
++-- Simulated seconds since the service started (advances once per driver tick, times game speed).
++local _simClock = 0
+ local _nextDebugId = 0
+ 
+ local function ensureDebugId(model: Model): string
+@@ -312,6 +323,7 @@
+ 	table.clear(_edgeDriverIndex)
+ 	table.clear(_connectorByNextEdgeIndex)
+ 	table.clear(_laneChangeIndex)
++	table.clear(_connectorByFromEdgeIndex)
+ end
+ 
+ local function addToIndex(index: { [string]: { any } }, key: string, state: DriverState)
+@@ -333,6 +345,8 @@
+ 			if lc then
+ 				addToIndex(_laneChangeIndex, lc.from, other)
+ 				addToIndex(_laneChangeIndex, lc.to, other)
++			else
++				addToIndex(_connectorByFromEdgeIndex, other.edgeId, other)
+ 			end
+ 		else
+ 			addToIndex(_edgeDriverIndex, other.edgeId, other)
+@@ -800,6 +814,13 @@
+ -- on one is what made an unsignalised crossing behave like a red light: four cars
+ -- stopped at the line, each holding the next, until the impatience timer let them
+ -- trickle through one at a time.
++-- Extra centre setback so the NOSE halts ~1 stud before the painted stop line, whatever
++-- the vehicle length. getStopLineGap already bakes a car-sized buffer into the gap;
++-- this adds the difference for anything longer than that (the truck-overruns-line fix).
++local function noseSetback(state: DriverState): number
++	return math.max(0, (state.halfLength or STOP_LINE_CAR_BUFFER) - STOP_LINE_CAR_BUFFER) + 1
++end
++
+ local function etaToStopLine(g: any, other: DriverState, otherEdge: any, nodeId: number): number
+ 	local speed = other.currentSpeed or 0
+ 	if speed < 1 then return math.huge end
+@@ -909,12 +930,27 @@
+ -- the lines; it must never send a car into one that is already crossing -- that is how
+ -- traffic drove straight through itself. A car held in the box by the queue on its exit is
+ -- traffic, and the cars behind it wait for it like any other jam.
+--- Compatible pairs: the same approach arm (parallel lanes), oncoming traffic when neither or
+--- both of the pair cut across it, and two nearside turns.
+-local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
++-- Whether a movement from another arm crosses ours. Compatible pairs: the same approach arm
++-- (parallel lanes, excluded by the callers), oncoming traffic when neither or both of the pair
++-- cut across it, and two nearside turns.
++local function movesConflict(myDir: Vector3, myMove: string, otherEdge: any, otherMove: string): boolean
+ 	local cross = crossingTurn()
+ 	local myCross = myMove == cross
++	if isOpposite(myDir, otherEdge.toDir) then
++		return myCross ~= (otherMove == cross)
++	end
+ 	local myNear = myMove ~= "straight" and myMove ~= "uturn" and not myCross
++	local otherNear = otherMove ~= "straight" and otherMove ~= "uturn" and otherMove ~= cross
++	return not (myNear and otherNear)
++end
++
++-- How far a car's nose is from its stop line at `nodeId` (negative once it is over it).
++local function distToStopLine(g: any, other: DriverState, otherEdge: any, nodeId: number): number
++	local cum = PathFollower.getCum(otherEdge)
++	return cum[#cum] - getStopLineGap(g, nodeId, otherEdge) - noseSetback(other) - other.edgeDist
++end
++
++local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
+ 	for _, other in pairs(_drivers) do
+ 		if other == state or not other.connector or not other.nextEdgeId or not other.model.Parent then continue end
+ 		local otherNext = g:GetEdge(other.nextEdgeId)
+@@ -922,16 +958,69 @@
+ 		local otherEdge = g:GetEdge(other.edgeId)
+ 		if not otherEdge or otherEdge.segmentId == edge.segmentId then continue end
+ 		local otherMove = otherEdge.outMovement and otherEdge.outMovement[other.nextEdgeId] or "straight"
+-		if isOpposite(myDir, otherEdge.toDir) then
+-			if myCross ~= (otherMove == cross) then return true end
+-		else
+-			local otherNear = otherMove ~= "straight" and otherMove ~= "uturn" and otherMove ~= cross
+-			if not (myNear and otherNear) then return true end
++		if movesConflict(myDir, myMove, otherEdge, otherMove) then return true end
++	end
++	-- A car over its stop line has committed and will not stop, but its path through the box
++	-- only starts at the junction mouth a few studs on: until then it is in the box all the same.
++	for _, inEdge in g._edgesByToNode[nodeId] or {} do
++		if inEdge.segmentId == edge.segmentId then continue end
++		for _, other in _edgeDriverIndex[inEdge.id] or {} do
++			local otherNextId = other.pendingNextEdgeId
++			if other == state or other.connector or not otherNextId or not other.model.Parent then continue end
++			if distToStopLine(g, other, inEdge, nodeId) >= -0.1 then continue end
++			local otherMove = inEdge.outMovement and inEdge.outMovement[otherNextId] or "straight"
++			if movesConflict(myDir, myMove, inEdge, otherMove) then return true end
+ 		end
+ 	end
+ 	return false
+ end
+ 
++-- How long a car on `edge` waits at a junction without signals before it takes its turn.
++local function turnWait(g: any, nodeId: number, edge: any): number
++	if getArmPriority(g, nodeId, edge.id) == "minor" then
++		for _, p in getNodeMeta(g, nodeId).armPriority do
++			if p == "major" then return TURN_WAIT_MINOR end
++		end
++	end
++	return TURN_WAIT_EQUAL
++end
++
++-- Courtesy at a junction without signals. The car that has waited longest at its line (its
++-- turn wait plus CLAIM_EXTRA, with room on its exit) is let in: every car whose path crosses
++-- its path holds at the line until it is through. One such car per junction at a time --
++-- when every stopped car could claim, each car held for one became a claimant in turn and
++-- the junction ran as an all-way stop. Without it a steady stream on one road, or the queue
++-- behind one car waiting to turn across it, starved the other approaches for minutes.
++-- Turns go by when the wait BEGAN (waitSince), never by blockedTime: that grows during each
++-- car's own update, so two cars compared mid-tick could each see the other as the longer
++-- waiter and both hold for good.
++local CLAIM_EXTRA = 6 -- s past its turn wait before the others stop to let a car in
++local function junctionClaimant(g: any, nodeId: number): (DriverState?, any)
++	local best, bestEdge, bestSince = nil, nil, 0
++	for _, inEdge in g._edgesByToNode[nodeId] or {} do
++		local threshold = turnWait(g, nodeId, inEdge) + CLAIM_EXTRA
++		for _, other in _edgeDriverIndex[inEdge.id] or {} do
++			if other.connector or not other.model.Parent then continue end
++			local wait = other.blockedTime or 0
++			if wait < threshold then continue end
++			local since = other.waitSince or (_simClock - wait)
++			if best and (since > bestSince or (since == bestSince and goesFirst(best, other))) then continue end
++			local nextId = other.pendingNextEdgeId
++			if not nextId or not exitLaneHasRoom(g, other, nextId) then continue end
++			if distToStopLine(g, other, inEdge, nodeId) > AT_LINE_DIST then continue end
++			best, bestEdge, bestSince = other, inEdge, since
++		end
++	end
++	return best, bestEdge
++end
++
++local function owesCourtesy(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
++	local claimant, claimEdge = junctionClaimant(g, nodeId)
++	if not claimant or claimant == state or claimEdge.segmentId == edge.segmentId then return false end
++	local claimMove = claimEdge.outMovement and claimEdge.outMovement[claimant.pendingNextEdgeId] or "straight"
++	return movesConflict(myDir, myMove, claimEdge, claimMove)
++end
++
+ -- A join between two pieces of road has no right-of-way rules, but where two lanes become one
+ -- (a lane drop) or swap across it, two cars can arrive side by side. Hold back while a car
+ -- from another lane of this road is crossing the join close by on a path that meets or
+@@ -1028,11 +1117,17 @@
+ 		return not boxHasConflict(g, state, edge, nodeId, myDir, myMove)
+ 	end
+ 
+-	-- Impatience backstop: after waiting too long for a gap, creep out so a busy
+-	-- major road can never block a yielding car forever. Never runs a red light
+-	-- (handled above), still respects exit-lane room (above), and never pulls out into
+-	-- a car already crossing the box (boxHasConflict).
+-	if (state.blockedTime or 0) >= IMPATIENCE_TIME
++	if not signalized and owesCourtesy(g, state, edge, nodeId, myDir, myMove) then
++		return false
++	end
++
++	-- Impatience backstop / taking a turn: after waiting its time for a gap, the car goes, so
++	-- a busy road can never block a yielding car forever. Without signals that time is short
++	-- (turnWait): the others let it in (owesCourtesy). Never runs a red light (handled above),
++	-- still respects exit-lane room (above), and never pulls out into a car already crossing
++	-- the box (boxHasConflict).
++	local patience = if signalized then IMPATIENCE_TIME else turnWait(g, nodeId, edge)
++	if (state.blockedTime or 0) >= patience
+ 		and not boxHasConflict(g, state, edge, nodeId, myDir, myMove) then
+ 		return true
+ 	end
+@@ -1548,6 +1643,21 @@
+ 	local nearest, nearestGap = queueScan(_edgeDriverIndex[laneId], state, laneId, myPos, false, nil, math.huge)
+ 	nearest, nearestGap = queueScan(_connectorByNextEdgeIndex[laneId], state, laneId, myPos, true, nearest, nearestGap)
+ 	nearest, nearestGap = queueScan(_laneChangeIndex[laneId], state, laneId, myPos, true, nearest, nearestGap)
++	-- Inside the box, a car that left OUR lane ahead of us is still in front of us until it is
++	-- through, whichever exit it takes: going straight on behind a slow turner from the same
++	-- lane, we wait for it instead of driving through it where the two paths still overlap.
++	-- Both measure from the same lane mouth, so distance along the connector compares.
++	if state.connector and not laneChangeOf(state) then
++		for _, other in _connectorByFromEdgeIndex[state.edgeId] or {} do
++			if other == state or not other.model.Parent then continue end
++			local gap = other.connDist - state.connDist
++			local tied = math.abs(gap) <= QUEUE_TIE_EPSILON and goesFirst(other, state)
++			if (gap > QUEUE_TIE_EPSILON or tied) and gap < nearestGap then
++				nearestGap = math.max(0, gap)
++				nearest = other
++			end
++		end
++	end
+ 	return nearest, if nearest then nearestGap else nil
+ end
+ 
+@@ -1778,13 +1888,6 @@
+ 	return math.max(sz.X, sz.Z) * 0.5
+ end
+ 
+--- Extra centre setback so the NOSE halts ~1 stud before the painted stop line, whatever
+--- the vehicle length. getStopLineGap already bakes a car-sized buffer into the gap;
+--- this adds the difference for anything longer than that (the truck-overruns-line fix).
+-local function noseSetback(state: DriverState): number
+-	return math.max(0, (state.halfLength or STOP_LINE_CAR_BUFFER) - STOP_LINE_CAR_BUFFER) + 1
+-end
+-
+ -- A DIRECTED car that leaves at the map edge did not arrive -- it lost its route on the
+ -- way (getPendingNextEdgeId falls through to the roamer pick when the route's next edge
+ -- is not an exit of the lane the car is on). Letting it leave is right; being NOISY about
+@@ -1803,7 +1906,7 @@
+ -- waiting merger that can still stop does, and lets it in (a zipper).
+ local LANE_CHANGE_TIME = 2.2      -- s a move-over takes at cruise speed (sets its length)
+ local LANE_CHANGE_KEEP_SPEED = 0.9 -- a move whose bend cap is below this share of the car's speed is too short to start
+-local LANE_CHANGE_HOLD_SPEED = 16 * WS -- studs/s: slower than this, a car out of window holds for a gap; faster, it re-plans
++local LANE_CHANGE_HOLD_SPEED = 16 * WS -- studs/s: on a highway, faster than this a car out of window re-plans instead of stopping
+ local LANE_CHANGE_PATIENCE = 8    -- s of waiting over which the speed margin shrinks to its floor
+ local LANE_CHANGE_REPLAN = 20     -- s trying with no gap at all before re-planning from this lane
+ local MERGE_COURTESY_WAIT = 1     -- s a merger waits before the lane beside it makes room
+@@ -2099,7 +2202,14 @@
+ 				-- (SIGNAL_FAULT_TIME) ever lets a car past a red.
+ 				local atRed = isSignalizedIntersection(edge.toNode)
+ 					and not TrafficSignalService.CanGo(edge.id, nextId)
+-				state.blockedTime = if atRed then (state.blockedTime or 0) else (state.blockedTime or 0) + dt
++				-- Only waiting AT the line counts: slowing for a car far ahead, or queueing
++				-- behind the car at the line, is not a turn waited for.
++				if distToStop > AT_LINE_DIST then
++					state.blockedTime = 0
++				elseif not atRed then
++					if (state.blockedTime or 0) == 0 then state.waitSince = _simClock end
++					state.blockedTime = (state.blockedTime or 0) + dt
++				end
+ 				state.stuckTime   = (state.stuckTime or 0) + dt
+ 				state.redTime     = if atRed then (state.redTime or 0) + dt else 0
+ 				interReason = if atRed then "redLight"
+@@ -2107,7 +2217,11 @@
+ 					elseif nextId and not exitLaneHasRoom(g, state, nextId) then "blocked"
+ 					else "yield"
+ 			else
+-				state.blockedTime = 0
++				-- Allowed in. blockedTime is kept until the car is over the line (the branch
++				-- below): zeroing it here, with the car still behind the line, took the turn
++				-- straight back -- the move step asked again with no wait on the clock and
++				-- the car stayed put, so a car whose turn had come never actually went.
++				if distToStop > AT_LINE_DIST then state.blockedTime = 0 end
+ 				state.stuckTime   = 0
+ 				state.redTime     = 0
+ 			end
+@@ -2356,8 +2470,9 @@
+ 		end
+ 
+ 		-- Lane change pending (tried before the move, above): drive on and hold at the end of
+-		-- the window until it starts. A car still at speed there does not stop dead across
+-		-- a fast road: it keeps its lane and re-plans, like a driver who missed the exit.
++		-- the window until it starts. On a highway a car still at speed there does not stop
++		-- dead: it keeps its lane and re-plans, like a driver who missed the exit. On a city
++		-- street it holds for the gap, as a driver waiting to get into a turn lane does.
+ 		-- Once per lane edge, so a re-plan that still wants this move falls back to the hold.
+ 		local lcTarget, _, lcLatest = routeLaneChange(g, state, currentEdge)
+ 		if lcTarget then
+@@ -2368,7 +2483,8 @@
+ 			local lcPos, lcDir = PathFollower.pointAtDist(currentEdge.points, cum, state.edgeDist)
+ 			PathFollower.place(state, lcPos, lcDir, dt)
+ 			if state.edgeDist >= holdAt - 1e-4 then
+-				if (state.currentSpeed or 0) > LANE_CHANGE_HOLD_SPEED and state.laneChangeMissed ~= currentEdge.id then
++				if currentEdge.roadClass == "highway" and (state.currentSpeed or 0) > LANE_CHANGE_HOLD_SPEED
++					and state.laneChangeMissed ~= currentEdge.id then
+ 					state.laneChangeMissed = currentEdge.id
+ 					if tryReroute(state) then break end
+ 				end
+@@ -3518,6 +3634,7 @@
+ 
+ 		local tickStart = os.clock()
+ 		for _ = 1, speed do
++			_simClock += simDt
+ 			rebuildDriverIndexes()
+ 			local g = nav()
+ 			if g then publishCongestionSnapshot(g) end

@@ -1,6 +1,6 @@
 # How to apply the City District fixes (step by step)
 
-There are three batches of fixes waiting in this folder. Apply them **in this order**,
+There are four batches of fixes waiting in this folder. Apply them **in this order**,
 because each one builds on the one before:
 
 | # | Folder | What it does |
@@ -8,6 +8,7 @@ because each one builds on the one before:
 | 1 | `2026-09-26-cars` | Car AI: no pointless lane changes, jams stay real, smooth highway lane changes, far cars drawn correctly |
 | 2 | `2026-09-26-stock-and-time` | 24-minute days (12-hour months), one "Stock" item, realistic deliveries and shopping |
 | 3 | `2026-09-26-visible-trips` | Every car trip is a real, visible car in traffic |
+| 4 | `2026-09-26-junction-rules` | Junctions without lights take turns fairly; no cars inside each other in a junction |
 
 Every batch folder has the same things inside:
 
@@ -61,7 +62,8 @@ Your local Claude is already connected to Studio, so it can edit the scripts dir
    (View > Output). Red text means an error -- copy it and give it to Claude.
 5. If there are no errors, stop the playtest and **save** (File > Save to Roblox, or
    Ctrl+S). Then do the same for batch 2, with the folder name
-   `2026-09-26-stock-and-time`, and then batch 3 with `2026-09-26-visible-trips`.
+   `2026-09-26-stock-and-time`, then batch 3 with `2026-09-26-visible-trips`, and then
+   batch 4 with `2026-09-26-junction-rules`.
 
 Why one batch at a time: if something breaks, you know exactly which batch did it.
 
@@ -87,12 +89,14 @@ paste wins. After each batch: Play, check Output for red errors, then save.
 
 ## Step 3: playtest checklist
 
-After all three batches:
+After all four batches:
 
 - **Clock:** a full day takes about 24 real minutes at 1x.
 - **Highway:** cars stay in their lane and keep their speed when they do change lanes.
 - **Jams:** make a junction gridlock on purpose. Cars stop and stay stopped (no driving
   through each other) until you fix the road.
+- **Junctions without lights:** every approach gets its turn (no side street waiting
+  minutes); now and then a main-road car stops to let one out. No cars inside each other.
 - **Far away:** zoom out and tilt the camera; the street you look at keeps all its cars.
 - **Shops/factories:** click one. "Sells/Produces: Stock" and how much it holds. Delivery
   trucks are rare (about twice a game week per shop) and bigger for bigger shops.
