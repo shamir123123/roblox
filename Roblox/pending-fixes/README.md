@@ -10,3 +10,6 @@ Apply batches oldest first; each builds on the one before:
 2. `2026-09-26-stock-and-time`
 3. `2026-09-26-visible-trips`
 4. `2026-09-26-junction-rules`
+5. `2026-09-26-roundabouts`
+
+Preview images of batch 5: `_previews/`.

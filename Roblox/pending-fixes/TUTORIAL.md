@@ -1,6 +1,6 @@
 # How to apply the City District fixes (step by step)
 
-There are four batches of fixes waiting in this folder. Apply them **in this order**,
+There are five batches of fixes waiting in this folder. Apply them **in this order**,
 because each one builds on the one before:
 
 | # | Folder | What it does |
@@ -9,6 +9,7 @@ because each one builds on the one before:
 | 2 | `2026-09-26-stock-and-time` | 24-minute days (12-hour months), one "Stock" item, realistic deliveries and shopping |
 | 3 | `2026-09-26-visible-trips` | Every car trip is a real, visible car in traffic |
 | 4 | `2026-09-26-junction-rules` | Junctions without lights take turns fairly; no cars inside each other in a junction |
+| 5 | `2026-09-26-roundabouts` | Roundabouts like the reference picture: brick apron, splitter islands, unbroken ring lines, centre presets |
 
 Every batch folder has the same things inside:
 
@@ -62,8 +63,8 @@ Your local Claude is already connected to Studio, so it can edit the scripts dir
    (View > Output). Red text means an error -- copy it and give it to Claude.
 5. If there are no errors, stop the playtest and **save** (File > Save to Roblox, or
    Ctrl+S). Then do the same for batch 2, with the folder name
-   `2026-09-26-stock-and-time`, then batch 3 with `2026-09-26-visible-trips`, and then
-   batch 4 with `2026-09-26-junction-rules`.
+   `2026-09-26-stock-and-time`, then batch 3 with `2026-09-26-visible-trips`, batch 4 with
+   `2026-09-26-junction-rules`, and then batch 5 with `2026-09-26-roundabouts`.
 
 Why one batch at a time: if something breaks, you know exactly which batch did it.
 
@@ -83,13 +84,13 @@ For each batch, in order, for each `.luau` file in its folder:
 4. Click back in the Studio script and press **Ctrl+V**.
 5. Repeat for every file in that batch.
 
-Some scripts appear in more than one batch (CitizenService, NPCDriverService). That is fine:
+Some scripts appear in more than one batch (CitizenService, NPCDriverService, RoadNavigationGraph). That is fine:
 the file in a later batch already includes the earlier batch's changes, so the last one you
 paste wins. After each batch: Play, check Output for red errors, then save.
 
 ## Step 3: playtest checklist
 
-After all four batches:
+After all five batches:
 
 - **Clock:** a full day takes about 24 real minutes at 1x.
 - **Highway:** cars stay in their lane and keep their speed when they do change lanes.
@@ -97,6 +98,9 @@ After all four batches:
   through each other) until you fix the road.
 - **Junctions without lights:** every approach gets its turn (no side street waiting
   minutes); now and then a main-road car stops to let one out. No cars inside each other.
+- **Roundabouts:** green centre (not grey), brick ring, brick triangles at the entries, dashed
+  lines all the way round. The new chip next to S/M/L picks the centre (Empty/Tree/Garden/
+  Palms/Fountain); click inside a roundabout with the tool to apply it.
 - **Far away:** zoom out and tilt the camera; the street you look at keeps all its cars.
 - **Shops/factories:** click one. "Sells/Produces: Stock" and how much it holds. Delivery
   trucks are rare (about twice a game week per shop) and bigger for bigger shops.
