@@ -1,0 +1,810 @@
+--- a/NavRouter
++++ b/NavRouter
+@@ -108,6 +108,20 @@
+ 	return root
+ end
+ 
++-- The bias is a driver's opinion of a STREET, so every lane of one carriageway shares it.
++-- Keyed per lane, a driver could like the next lane over by more than LANE_CHANGE_SECONDS
++-- on a long highway piece and change lanes for nothing. Cached per edge table: the key is
++-- asked for on every edge the search prices.
++local _roadKeyOf: { [any]: string } = setmetatable({}, { __mode = "k" }) :: any
++local function roadKey(edge: any): string
++	local key = _roadKeyOf[edge]
++	if not key then
++		key = `{edge.segmentId}{if edge.forward then "+" else "-"}`
++		_roadKeyOf[edge] = key
++	end
++	return key
++end
++
+ -- What one edge costs THIS driver, in SECONDS. Built the way a real routing engine
+ -- builds it (see NavCost for the sources), then coloured by who is driving:
+ --
+@@ -171,7 +185,7 @@
+ 	seconds *= NavCost.classFactor(edge.roadClass, if profile then profile.useHighways else nil)
+ 	seconds += NavCost.classPenaltySeconds(edge.roadClass)
+ 
+-	return seconds * DriverProfile.edgeBias(profile, edge.id)
++	return seconds * DriverProfile.edgeBias(profile, roadKey(edge))
+ end
+ 
+ -- Turn costs are already seconds (OSRM sigmoid + Valhalla manoeuvre penalty, baked
+--- a/RoadNavigationGraph
++++ b/RoadNavigationGraph
+@@ -771,27 +771,36 @@
+ 	end
+ end
+ 
+--- 0..1 share of this edge already spoken for by OTHER drivers' committed routes.
+--- `exceptToken` is the asking driver's own booking, which must not count against it.
++-- 0..1 share of this edge's carriageway already spoken for by OTHER drivers' committed
++-- routes. `exceptToken` is the asking driver's own booking, which must not count against it.
++-- Pooled over every same-direction lane of the road: a booking is intent to use the ROAD,
++-- not a queue in one lane. Priced per lane, one booked car made the lane beside it look
++-- cheaper than LANE_CHANGE_SECONDS, so each planner moved over to the least-booked lane and
++-- highway traffic weaved for nothing. Real queues still split lanes through congestion.
+ function RoadNavigationGraph.GetEdgeBookingPressure(self: any, edgeId: string, exceptToken: number?): number
+-	local count = self._edgeBookingCount[edgeId]
+-	if not count or count <= 0 then
++	local edge = self._edges[edgeId]
++	if not edge then
+ 		return 0
+ 	end
+-	if exceptToken ~= nil then
+-		local bucket = self._edgeBookings[edgeId]
+-		if bucket and bucket[exceptToken] then
+-			count -= 1
++	local count, lanes = 0, 0
++	for _, laneId in self._edgesBySegment[edge.segmentId] or { edgeId } do
++		local lane = self._edges[laneId]
++		if not lane or lane.forward ~= edge.forward then continue end
++		lanes += 1
++		local laneCount = self._edgeBookingCount[laneId]
++		if not laneCount then continue end
++		count += laneCount
++		if exceptToken ~= nil then
++			local bucket = self._edgeBookings[laneId]
++			if bucket and bucket[exceptToken] then
++				count -= 1
++			end
+ 		end
+ 	end
+ 	if count <= 0 then
+ 		return 0
+ 	end
+-	local edge = self._edges[edgeId]
+-	if not edge then
+-		return 0
+-	end
+-	local capacity = math.max(1, edge.length / (RoadConstants.NAV_BOOKING_CAPACITY_GAP or 90))
++	local capacity = math.max(1, edge.length / (RoadConstants.NAV_BOOKING_CAPACITY_GAP or 90)) * math.max(1, lanes)
+ 	return math.clamp(count / capacity, 0, 1)
+ end
+ 
+--- a/NPCDriverService
++++ b/NPCDriverService
+@@ -73,11 +73,14 @@
+ local UNSTUCK_BACKUP_RATE = 18 * WS
+ local ACCEL_RATE        = 28 * WS
+ local BRAKE_RATE        = 60 * WS
+-local IMPATIENCE_TIME   = 6    -- s a car may yield at a junction before it creeps out (anti-deadlock)
+-local STUCK_TIME        = 45   -- s absolute cap: creep out past anything (even a broken red) so nothing freezes forever
+-local BLOCKED_EXIT_ESCAPE = 20 -- s blocked by a downstream-jammed exit (NOT a red) before forcing through to break a gridlock cycle
+-local CONNECTOR_STANDOFF_ESCAPE = 4  -- s wedged against crossing/oncoming traffic mid-turn before creeping through
+-local CONNECTOR_QUEUE_ESCAPE    = 10 -- s stuck behind a same-direction car mid-turn before creeping through
++-- Traffic is never cleared by a timer. A queue, a full exit, a red or a gridlocked box holds
++-- every car in it until the road clears -- or until the player rebuilds the road. Only a
++-- car the traffic rules cannot explain (see waitingInTraffic) counts as bugged, and only a
++-- bugged car is pushed through or removed.
++local IMPATIENCE_TIME   = 6    -- s a car waits for a gap at a junction before it noses out (never into a full exit or across a car in the box)
++local SIGNAL_FAULT_TIME = 180  -- s of one unbroken red before the signal counts as broken (no working cycle is this long)
++local CONNECTOR_STANDOFF_ESCAPE = 4  -- s two cars blocking EACH OTHER wait before one of them creeps through
++local RESCUE_CLEAR_DIST = 30 * WS    -- studs a rescued (bugged) car must cover before it obeys traffic again
+ local TURN_SLOW_ZONE    = 20 * WS   -- studs before the stop line over which cars ease down to turn entry speed
+ local CONNECTOR_LAT_ACCEL = 14 * WS -- studs/s^2 comfortable lateral accel through a turn
+ local MIN_TURN_SPEED    = 6 * WS    -- studs/s floor so tight U-turns never crawl to a stop
+@@ -99,6 +102,7 @@
+ local TRAFFIC_REROUTE_MAX_PER_TRIP = RoadConstants.NAV_REROUTE_MAX_PER_TRIP or 2
+ local TRAFFIC_REROUTE_REVERSAL_LOCK = RoadConstants.NAV_REROUTE_REVERSAL_LOCK or 60
+ local LANE_MOVE_MIN_SAVING = 3 -- s a same-roads plan on another lane must save, beyond the move itself
++local ROAMER_LANE_KEEP = 2.5   -- extra cars an ambient roamer accepts in its own lane before moving over at a junction
+ 
+ -- Camera-pos rate limiting is handled entirely by NetMiddleware.RegisterServerRateLimit.
+ local CAM_REPORT_MIN_DT = 1 / 15  -- 15 Hz max, passed to NetMiddleware
+@@ -138,9 +142,12 @@
+ 	currentSpeed: number?, -- Keeps track of smoothed speed for fluid acceleration/deceleration
+ 	vehicleClass: VehicleTypes.VehicleClass,
+ 	blockedTime:  number?, -- seconds spent yielding at the current junction (drives impatience)
+-	stuckTime:    number?, -- seconds stopped at a junction for ANY reason (drives the anti-freeze cap)
++	stuckTime:    number?, -- seconds stopped at a junction for ANY reason (jam readouts)
++	redTime:      number?, -- seconds of the current unbroken red (drives SIGNAL_FAULT_TIME)
+ 	connSpeedCap: number?, -- max speed through the current connector (set from its tightest bend)
+ 	connBlockedTime: number?, -- seconds wedged in a standoff (drives the push-through escape)
++	blockedBy:    Model?,  -- the car right in front with no room left to it (nil when clear)
++	rescueFrom:   Vector3?, -- set by the stall watchdog: a bugged car pushes through until it has left here
+ 	lastProgressPos: Vector3?, -- watchdog: where the car last made real progress
+ 	noProgressTime: number?,   -- watchdog: seconds without real movement
+ 	rescueCount: number?,      -- watchdog: consecutive rescues without progress between them
+@@ -167,6 +174,7 @@
+ 	profile:      DriverProfile.Profile?,
+ 	bookingToken: number?,      -- identifies this trip's route reservation on the graph
+ 	laneChangeWait: number?,    -- seconds held at the end of a lane-change window with no gap
++	laneChangeMissed: string?,  -- lane edge whose window this car overran at speed and re-planned from
+ 	lodFar: boolean?,           -- far from every player: thinks at FAR_TICK (see FAR_LOD_DIST)
+ 	lodAccum: number?,          -- sim time banked since this car last thought
+ 	lodCheckAt: number?,        -- os.clock of the next near/far re-evaluation
+@@ -491,13 +499,14 @@
+ 		table.insert(lanes, outId)
+ 	end
+ 	local lanes = lanesBySegment[segmentIds[math.random(1, #segmentIds)]]
+-	-- Of the lanes this exit allows, take the emptiest, staying in lane on a tie: ambient
+-	-- cars spread over a wide road instead of stacking in one lane or weaving at random.
++	-- Of the lanes this exit allows, take the emptiest, staying in lane unless another is
++	-- clearly emptier: ambient cars spread over a wide road instead of stacking in one lane,
++	-- but a one-car difference is not worth a swerve across the box at every road join.
+ 	local nextId, fewest = lanes[1], math.huge
+ 	for _, id in lanes do
+ 		local outEdge = g:GetEdge(id)
+ 		local load = #(_edgeDriverIndex[id] or {})
+-			+ (if outEdge and outEdge.laneOrdinal == edge.laneOrdinal then 0 else 0.5)
++			+ (if outEdge and outEdge.laneOrdinal == edge.laneOrdinal then 0 else ROAMER_LANE_KEEP)
+ 		if load < fewest then
+ 			fewest = load
+ 			nextId = id
+@@ -855,8 +864,8 @@
+ 							return false
+ 						elseif myPriority == otherPriority then
+ 							-- Left-before-right: yield to equal-priority cross traffic approaching from
+-							-- our left. Anti-symmetric, so exactly one of a pair yields (the stuck/
+-							-- impatience escapes above break any 4-way circular wait).
++							-- our left. Anti-symmetric, so exactly one of a pair yields (the
++							-- impatience escape above breaks any 4-way circular wait).
+ 							local leftX, leftZ = myDir.Z, -myDir.X
+ 							if (-otherEdge.toDir.X) * leftX + (-otherEdge.toDir.Z) * leftZ > 0 then
+ 								return false
+@@ -902,11 +911,10 @@
+ end
+ 
+ -- True while a car on a CONFLICTING path is physically inside this junction (on its connector
+--- through the node). The impatience / blocked-exit escapes exist to break standoffs between
+--- cars WAITING at the lines; they must never send a car into one that is already crossing --
+--- that is how traffic drove straight through itself. A car inside the box is moving and always
+--- clears it (exitLaneHasRoom keeps anyone from entering onto a full exit), so waiting on one
+--- cannot deadlock; STUCK_TIME stays the absolute backstop.
++-- through the node). The impatience escape exists to break standoffs between cars WAITING at
++-- the lines; it must never send a car into one that is already crossing -- that is how
++-- traffic drove straight through itself. A car held in the box by the queue on its exit is
++-- traffic, and the cars behind it wait for it like any other jam.
+ -- Compatible pairs: the same approach arm (parallel lanes), oncoming traffic when neither or
+ -- both of the pair cut across it, and two nearside turns.
+ local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
+@@ -956,13 +964,16 @@
+ end
+ 
+ local function canEnterIntersection(g: any, state: DriverState, edge: any, nextEdgeId: string): boolean
++	-- A bugged car the stall watchdog is rescuing is pushed through; nothing else is.
++	if state.rescueFrom then
++		return true
++	end
+ 	local nodeId = edge.toNode
+ 	if not isIntersectionNode(g, nodeId) then
+ 		-- A dead-end U-turn back onto the same road needs the same one-at-a-time
+ 		-- gating an intersection gets. Without it, cars commit U-turns into a full
+ 		-- return lane and clump at the cul-de-sac mouth until the road gridlocks.
+-		-- Escapes: go once the exit clears, or after waiting too long (impatience /
+-		-- absolute anti-freeze) so a jammed return lane can never freeze it forever.
++		-- A jammed return lane is traffic: wait until it has room.
+ 		local myMove = edge.outMovement and edge.outMovement[nextEdgeId]
+ 		if myMove == "uturn" then
+ 			-- Same-segment only: a sharp bend onto ANOTHER road classifies as a
+@@ -972,13 +983,7 @@
+ 			if not nextEdge or nextEdge.segmentId ~= edge.segmentId then
+ 				return true
+ 			end
+-			if exitLaneHasRoom(g, state, nextEdgeId) then
+-				return true
+-			end
+-			if (state.blockedTime or 0) >= IMPATIENCE_TIME then
+-				return true
+-			end
+-			return (state.stuckTime or 0) >= STUCK_TIME
++			return exitLaneHasRoom(g, state, nextEdgeId)
+ 		end
+ 		return joinClear(g, state, edge, nextEdgeId)
+ 	end
+@@ -987,17 +992,14 @@
+ 	-- never silently fall back to ordinary junction logic. A circulating car has
+ 	-- absolute priority and never yields at a ring node (the follower clearance keeps
+ 	-- it off the car ahead, so no node-by-node stutter). An entering car gives way to
+-	-- circulating traffic, but still creeps in after the impatience / anti-freeze
+-	-- escapes so a busy ring can never trap it.
++	-- circulating traffic, but noses in after the impatience escape so a busy ring
++	-- cannot hold it -- never onto a full ring lane.
+ 	if edge.isRoundabout then
+ 		return true
+ 	end
+ 	do
+ 		local nextEdge = g:GetEdge(nextEdgeId)
+ 		if nextEdge and nextEdge.isRoundabout then
+-			if (state.stuckTime or 0) >= STUCK_TIME then
+-				return exitLaneHasRoom(g, state, nextEdgeId)
+-			end
+ 			if not exitLaneHasRoom(g, state, nextEdgeId) then
+ 				return false
+ 			end
+@@ -1012,34 +1014,26 @@
+ 	local signalized = isSignalizedIntersection(nodeId)
+ 	local myMove = edge.outMovement and edge.outMovement[nextEdgeId] or "straight"
+ 	local myDir  = edge.toDir
+-
+-	-- Absolute anti-freeze: after an absurd wait (malfunctioning signal, or a gridlock
+-	-- pile after a road edit), creep out regardless of the light AND regardless of exit
+-	-- room. Requiring room here let a true deadlock cycle -- every car waiting on the next
+-	-- edge, whose exit is blocked by a car waiting on US -- freeze forever because nobody
+-	-- could ever move first. A brief visual overlap as one car pushes through breaks the
+-	-- cycle; cars are anchored, so there is no physical pileup. Nothing stays frozen.
+-	if (state.stuckTime or 0) >= STUCK_TIME then
+-		return true
+-	end
++	-- A red that outlasts any real cycle is a broken signal, not traffic: the junction
++	-- works as a give-way until the light changes again.
++	local signalFault = signalized and (state.redTime or 0) >= SIGNAL_FAULT_TIME
+ 
+ 	-- A red or yellow light is an unconditional stop.
+-	if signalized and not TrafficSignalService.CanGo(edge.id, nextEdgeId) then
++	if signalized and not signalFault and not TrafficSignalService.CanGo(edge.id, nextEdgeId) then
+ 		return false
+ 	end
+ 
+-	-- Don't enter unless the exit lane has room (never block the box) -- UNLESS congestion
+-	-- alone has blocked us this long, in which case the box is gridlocked and someone must
+-	-- move first. blockedTime is reset to 0 at a red (see the mustStop accounting), so this
+-	-- forces through a jam but never runs a red.
++	-- Don't enter unless the exit lane has room. However long it has been full, a full exit
++	-- is a jam: a gridlocked box stays gridlocked until the queue ahead moves or the player
++	-- changes the roads.
+ 	if not exitLaneHasRoom(g, state, nextEdgeId) then
+-		if (state.blockedTime or 0) >= BLOCKED_EXIT_ESCAPE
+-			and not boxHasConflict(g, state, edge, nodeId, myDir, myMove) then
+-			return true
+-		end
+ 		return false
+ 	end
+ 
++	if signalFault then
++		return not boxHasConflict(g, state, edge, nodeId, myDir, myMove)
++	end
++
+ 	-- Impatience backstop: after waiting too long for a gap, creep out so a busy
+ 	-- major road can never block a yielding car forever. Never runs a red light
+ 	-- (handled above), still respects exit-lane room (above), and never pulls out into
+@@ -1508,11 +1502,12 @@
+ end
+ 
+ -- == Stall watchdog ============================================================
+--- Last-resort safety net: NO car may ever freeze forever, whatever the cause.
+--- Zero movement for STALL_RESCUE_TIME (legit red-light waits are bounded well
+--- below it by signal cycles plus the STUCK_TIME creep-out) means something is
+--- truly wedged: dump the full state for diagnosis, then re-seat the car. If it
+--- stalls again with no progress in between, respawn it on a random edge.
++-- Last-resort safety net for BUGGED cars only. A car held by traffic (see
++-- waitingInTraffic) waits as long as the traffic does -- a gridlock is part of the
++-- simulation and the player's to fix. Zero movement for STALL_RESCUE_TIME with no
++-- traffic reason means something is truly wedged: dump the full state for diagnosis,
++-- then re-seat the car and let it push through. If it stalls again with no progress
++-- in between, respawn it on a random edge.
+ local function dumpStall(state: DriverState)
+ 	warn(`[NPCDriverService] {state.model.Name} stalled {STALL_RESCUE_TIME}s -- rescuing.`
+ 		.. ` edge={state.edgeId}@{string.format("%.1f", state.edgeDist)}`
+@@ -1562,18 +1557,38 @@
+ 	return nearest, if nearest then nearestGap else nil
+ end
+ 
++-- Two cars each other's blocker: nose to nose or locked across each other in a box. No
++-- traffic can ever clear that, so it is a fault, not a jam.
++local function inMutualStandoff(state: DriverState): boolean
++	local blocker = state.blockedBy
++	local other = if blocker then _drivers[blocker] else nil
++	return other ~= nil and other.blockedBy == state.model
++end
++
+ -- Standing still for a reason a driver would recognise: in a queue behind another car, at a
+--- red, or waiting for a gap to merge. A jam is traffic, not a fault -- it stays until the
+--- player fixes the road, so none of these ever counts toward a rescue.
++-- red, waiting for a gap or a merge, held by a full exit, or blocked by a car that is itself
++-- held up. A jam is traffic, not a fault -- it stays until the player fixes the road, so
++-- none of these ever counts toward a rescue. A blocker with no driver behind it is not
++-- traffic: nothing will ever move it out of the way.
+ local function waitingInTraffic(state: DriverState): boolean
++	local blocker = state.blockedBy
++	if blocker then
++		return _drivers[blocker] ~= nil and not inMutualStandoff(state)
++	end
+ 	local reason = state.stopReason
+-	if reason == "carAhead" or reason == "redLight" or reason == "laneChange" or reason == "merge" then return true end
+-	if reason == "blocked" and (state.blockerDot or -1) >= 0.3 then return true end
++	if reason == "carAhead" or reason == "redLight" or reason == "laneChange" or reason == "merge"
++		or reason == "yield" or reason == "blocked" then
++		return true
++	end
+ 	return getNearestQueueLeader(state) ~= nil
+ end
+ 
+ local function stallWatchdog(state: DriverState, dt: number)
+ 	local pos = getStatePosition(state)
++	local from = state.rescueFrom
++	if from and (pos - from).Magnitude > RESCUE_CLEAR_DIST then
++		state.rescueFrom = nil
++	end
+ 	local last = state.lastProgressPos
+ 	if not last or (pos - last).Magnitude > STALL_MOVE_EPSILON or waitingInTraffic(state) then
+ 		state.lastProgressPos = pos
+@@ -1593,8 +1608,7 @@
+ 		state.noProgressTime = 0
+ 		state.lastProgressPos = nil
+ 		if tryReroute(state) then
+-			state.blockedTime = IMPATIENCE_TIME
+-			state.connBlockedTime = CONNECTOR_QUEUE_ESCAPE
++			state.rescueFrom = getStatePosition(state)
+ 		else
+ 			abortDirected(state)
+ 		end
+@@ -1636,7 +1650,7 @@
+ 	end
+ 
+ 	-- First rescue: clear every bit of maneuver state, re-seat on the nearest
+-	-- lane, and prime the escape timers so it creeps past any gating at once.
++	-- lane, and let it push past whatever gated it.
+ 	state.connector = nil
+ 	state.connCum = nil
+ 	state.connDist = 0
+@@ -1644,8 +1658,9 @@
+ 	state.atDeadEnd = false
+ 	state.deadEndTimer = 0
+ 	anchorToNearest(state)
+-	state.blockedTime = IMPATIENCE_TIME
+-	state.connBlockedTime = CONNECTOR_QUEUE_ESCAPE
++	if state.model.Parent then
++		state.rescueFrom = getStatePosition(state)
++	end
+ end
+ 
+ local function getNearestQueueGap(state: DriverState): number?
+@@ -1793,6 +1808,8 @@
+ -- car length it needs. The target lane makes the room instead -- the first car behind a
+ -- waiting merger that can still stop does, and lets it in (a zipper).
+ local LANE_CHANGE_TIME = 2.2      -- s a move-over takes at cruise speed (sets its length)
++local LANE_CHANGE_KEEP_SPEED = 0.9 -- a move whose bend cap is below this share of the car's speed is too short to start
++local LANE_CHANGE_HOLD_SPEED = 16 * WS -- studs/s: slower than this, a car out of window holds for a gap; faster, it re-plans
+ local LANE_CHANGE_PATIENCE = 8    -- s of waiting over which the speed margin shrinks to its floor
+ local LANE_CHANGE_REPLAN = 20     -- s trying with no gap at all before re-planning from this lane
+ local MERGE_COURTESY_WAIT = 1     -- s a merger waits before the lane beside it makes room
+@@ -1846,9 +1863,12 @@
+ 	return true, nil
+ end
+ 
+-local function tryStartLaneChange(g: any, state: DriverState, edge: any, targetId: string, latest: number): (boolean, DriverState?)
++-- Third return: true when what is left of this road piece is too short to move over at the
++-- car's speed -- the squeezed ribbon's bend cap would brake it across both lanes. That is a
++-- geometry refusal, not a missing gap, so the lane beside is not asked to make room.
++local function tryStartLaneChange(g: any, state: DriverState, edge: any, targetId: string, latest: number): (boolean, DriverState?, boolean)
+ 	local target = g:GetEdge(targetId)
+-	if not target then return false, nil end
++	if not target then return false, nil, false end
+ 	local minLength = g.LANE_CHANGE_MIN_LENGTH or 14
+ 	local fromCum = PathFollower.getCum(edge)
+ 	local toCum = PathFollower.getCum(target)
+@@ -1859,9 +1879,13 @@
+ 	-- A car held past the window end (swap winner, re-plan) still gets the shortest move.
+ 	local shortest = d0 + minLength * 0.5
+ 	local d1 = math.clamp(d0 + length, shortest, math.max(shortest, toCum[#toCum] - margin))
+-	local clear, swapWith = laneChangeGapClear(state, targetId, d0, d1)
+-	if not clear then return false, swapWith end
+ 	local pts = g:GetLaneChangeRibbon(edge.id, targetId, d0, d1)
++	local cap = connectorSpeedCap(pts)
++	if cap and cap < (state.currentSpeed or 0) * LANE_CHANGE_KEEP_SPEED then
++		return false, nil, true
++	end
++	local clear, swapWith = laneChangeGapClear(state, targetId, d0, d1)
++	if not clear then return false, swapWith, false end
+ 	startConnector(state, pts, targetId, d1)
+ 	state.laneChange = if state.connector == pts
+ 		then { pts = pts, from = edge.id, to = targetId, d0 = d0, d1 = d1 }
+@@ -1870,7 +1894,34 @@
+ 	state.mergeInto = nil
+ 	state.mergeHoldAt = nil
+ 	tagCarInfo(state, "ChangingLane", targetId)
+-	return true, nil
++	return true, nil, false
++end
++
++-- Too little of this piece left to move over at speed: make the move on the next piece of
++-- the road instead, from the start of its window, the way a driver who missed the gap tries
++-- again further on. Only when the route carries on along the target lane onto a next piece
++-- this lane also feeds, and that piece allows the same move. The route is copied, never
++-- edited in place: a caller may hold the table it passed to DriveDirected.
++local function deferLaneChange(g: any, state: DriverState, edge: any, targetId: string): boolean
++	local route = state.route
++	local i = state.routeIndex or 1
++	if not route or route[i + 1] ~= targetId then return false end
++	local afterId = route[i + 2]
++	local after = if afterId then g:GetEdge(afterId) else nil
++	if not after or after.segmentId == edge.segmentId then return false end
++	for _, outId in edge.out do
++		local stay = g:GetEdge(outId)
++		if stay and stay.segmentId == after.segmentId and stay.forward == after.forward
++			and edgeAllows(stay, state.vehicleClass) and g:GetLaneChangeWindow(outId, afterId) then
++			local deferred = table.clone(route)
++			deferred[i + 1] = outId
++			state.route = deferred
++			state.pendingNextEdgeId = nil
++			bookRoute(state)
++			return true
++		end
++	end
++	return false
+ end
+ 
+ -- A move refused this tick: count the wait, ask the lane beside to make room, and settle a
+@@ -1960,14 +2011,16 @@
+ 		local uEdge = getUTurnEdge(g, edge)
+ 		if uEdge then
+ 			-- Wait until the exit is clear so cars turn one at a time instead of
+-			-- piling on top of each other at the dead end. Escape after waiting too
+-			-- long so a jammed return lane can never freeze the dead end forever.
+-			if not exitLaneHasRoom(g, state, uEdge.id) then
++			-- piling on top of each other at the dead end. A jammed return lane is
++			-- traffic: the dead end waits as long as it does.
++			if not exitLaneHasRoom(g, state, uEdge.id) and not state.rescueFrom then
+ 				state.blockedTime = (state.blockedTime or 0) + 0.25
+-				if (state.blockedTime or 0) < IMPATIENCE_TIME then
+-					state.deadEndTimer = 0.25
+-					return
+-				end
++				state.deadEndTimer = 0.25
++				-- This branch skips the tick that records why the car is stopped; say it
++				-- here, or the stall watchdog would take a jam for a fault.
++				state.stopReason = "blocked"
++				state.blockedBy = nil
++				return
+ 			end
+ 			state.blockedTime = 0
+ 			local connPts = buildUTurnArc(edge, uEdge)
+@@ -2003,9 +2056,10 @@
+ 	local carPos = getStatePosition(state)
+ 	local carDir = if state.smoothCFrame then state.smoothCFrame.LookVector else Vector3.zAxis
+ 	local currentSpeed = state.currentSpeed or state.speed
+-	local proximitySpeedFactor, forwardClearance, blockerDot =
++	local proximitySpeedFactor, forwardClearance, blockerDot, blocker =
+ 		PathFollower.getMotionLimits(state.model, carPos, carDir)
+ 	state.blockerDot = blockerDot
++	state.blockedBy = if forwardClearance <= 0.5 then blocker else nil
+ 
+ 	-- Check stopping requirements on the current edge ahead of execution
+ 	local edge = g:GetEdge(state.edgeId)
+@@ -2046,12 +2100,14 @@
+ 			if not canEnter then
+ 				mustStop = true
+ 				-- blockedTime counts only time yielding (NOT at a red -- the light will
+-				-- change) so impatience breaks deadlocks; stuckTime counts ALL waiting so
+-				-- the absolute anti-freeze cap also rescues a car stuck at a broken red.
++				-- change) so impatience can take a gap; stuckTime counts ALL waiting for the
++				-- jam readouts; redTime counts one unbroken red, so only a broken signal
++				-- (SIGNAL_FAULT_TIME) ever lets a car past a red.
+ 				local atRed = isSignalizedIntersection(edge.toNode)
+ 					and not TrafficSignalService.CanGo(edge.id, nextId)
+ 				state.blockedTime = if atRed then (state.blockedTime or 0) else (state.blockedTime or 0) + dt
+ 				state.stuckTime   = (state.stuckTime or 0) + dt
++				state.redTime     = if atRed then (state.redTime or 0) + dt else 0
+ 				interReason = if atRed then "redLight"
+ 					elseif not isIntersectionNode(g, edge.toNode) and not (edge.outMovement and edge.outMovement[nextId] == "uturn") then "merge"
+ 					elseif nextId and not exitLaneHasRoom(g, state, nextId) then "blocked"
+@@ -2059,10 +2115,12 @@
+ 			else
+ 				state.blockedTime = 0
+ 				state.stuckTime   = 0
++				state.redTime     = 0
+ 			end
+ 		else
+ 			state.blockedTime = 0
+ 			state.stuckTime   = 0
++			state.redTime     = 0
+ 		end
+ 
+ 		resolveQueueSpacing(state, edge, cum, dt)
+@@ -2078,8 +2136,12 @@
+ 			state.laneChangeWait = 0
+ 			state.mergeHoldAt = nil
+ 		elseif state.edgeDist >= lcEarliest then
+-			local started, swapWith = tryStartLaneChange(g, state, edge, lcTarget, lcLatest)
+-			if not started then
++			local started, swapWith, tooShort = tryStartLaneChange(g, state, edge, lcTarget, lcLatest)
++			if tooShort then
++				-- Keep cruising in lane: move over on the next piece, or (if this was the
++				-- last chance) re-plan at the window end -- see the hold in the move loop.
++				deferLaneChange(g, state, edge, lcTarget)
++			elseif not started then
+ 				waitForMerge(state, lcTarget, lcLatest, swapWith, dt)
+ 				if (state.laneChangeWait or 0) > LANE_CHANGE_REPLAN then
+ 					state.laneChangeWait = 0
+@@ -2175,19 +2237,17 @@
+ 	-- forwardClearance and blockerDot were produced with proximitySpeedFactor
+ 	-- above, so the nearby-car buckets are queried only once per driver tick.
+ 
+-	-- Anti-freeze: cars wedged against crossing/oncoming traffic (classic at
+-	-- dead-end U-turn bulbs) zero each other's clearance and nothing else will
+-	-- ever move them -- mutual blocks never clear on their own. This applies on
+-	-- edges too: a car that lands off its U-turn still overlapping the next
+-	-- waiter must creep free, not wait forever. A same-direction blocker is a
+-	-- genuine queue, so only a car mid-connector may push through one, and only
+-	-- after much longer. Stop lines stay respected: this only lifts the
+-	-- proximity clamp, never the red-light/yield travel limit.
+-	if forwardClearance <= 0.5 and blockerDot ~= nil
+-		and (blockerDot < 0.3 or state.connector) then
++	-- Two cars blocking EACH OTHER (nose to nose at a dead-end U-turn bulb, or locked
++	-- across each other in a box) can never clear by themselves, so after a short wait
++	-- the tie-break winner creeps through and the other waits for it. Anything else in
++	-- the way is traffic and holds us as long as it stands -- a car stuck in a jam in the
++	-- box included. A rescued (bugged) car pushes through at once. Stop lines stay
++	-- respected: this only lifts the proximity clamp, never the red-light/yield limit.
++	local blockerState = if state.blockedBy then _drivers[state.blockedBy] else nil
++	local standoffWinner = blockerState ~= nil and inMutualStandoff(state) and goesFirst(state, blockerState)
++	if state.blockedBy and (standoffWinner or state.rescueFrom) then
+ 		state.connBlockedTime = (state.connBlockedTime or 0) + dt
+-		local escapeAfter = if blockerDot < 0.3 then CONNECTOR_STANDOFF_ESCAPE else CONNECTOR_QUEUE_ESCAPE
+-		if state.connBlockedTime >= escapeAfter then
++		if state.rescueFrom or state.connBlockedTime >= CONNECTOR_STANDOFF_ESCAPE then
+ 			forwardClearance = math.huge
+ 			currentSpeed = math.max(currentSpeed, MIN_TURN_SPEED * 0.5)
+ 			state.currentSpeed = currentSpeed
+@@ -2302,7 +2362,9 @@
+ 		end
+ 
+ 		-- Lane change pending (tried before the move, above): drive on and hold at the end of
+-		-- the window until it starts.
++		-- the window until it starts. A car still at speed there does not stop dead across
++		-- a fast road: it keeps its lane and re-plans, like a driver who missed the exit.
++		-- Once per lane edge, so a re-plan that still wants this move falls back to the hold.
+ 		local lcTarget, _, lcLatest = routeLaneChange(g, state, currentEdge)
+ 		if lcTarget then
+ 			local holdAt = math.max(lcLatest, state.mergeHoldAt or 0, state.edgeDist)
+@@ -2312,6 +2374,10 @@
+ 			local lcPos, lcDir = PathFollower.pointAtDist(currentEdge.points, cum, state.edgeDist)
+ 			PathFollower.place(state, lcPos, lcDir, dt)
+ 			if state.edgeDist >= holdAt - 1e-4 then
++				if (state.currentSpeed or 0) > LANE_CHANGE_HOLD_SPEED and state.laneChangeMissed ~= currentEdge.id then
++					state.laneChangeMissed = currentEdge.id
++					if tryReroute(state) then break end
++				end
+ 				state.currentSpeed = 0
+ 				state.stopReason = "laneChange"
+ 				break
+@@ -2837,6 +2903,11 @@
+ 	return state ~= nil and state.route ~= nil
+ end
+ 
++-- Whether `model` is driving on the traffic AI right now (any trip, or an ambient roamer).
++function NPCDriverService.IsOnRoad(model: Model): boolean
++	return _drivers[model] ~= nil
++end
++
+ -- Is any vehicle within `radius` studs of `pos`? PathFollower streams a near car's pose to
+ -- the clients and STOPS writing its instance CFrame, so a workspace overlap query sees the
+ -- car parked on the spawn point it left minutes ago -- which is why every outside connection
+@@ -3376,11 +3447,9 @@
+ 
+ local CONN_DESPAWN_RADIUS = 12 -- studs from a connection: heading OUT here = left the city
+ local CONN_NEAR_RADIUS    = 40 -- studs from a connection: counts as "at the entrance"
+--- Long enough that a NORMAL wait survives: arrivals spawn ~24 studs from the connection
+--- at speed 0 and often queue or yield there -- at 3s this cleared nearly every move-in
+--- car mid-trip (the "cars never drive in" bug). Real wedges still clear well before the
+--- callers' own ~60s watchdogs.
+-local STUCK_DESPAWN_TIME  = 15 -- s stalled at the entrance (either direction) before we clear it
++-- Counted on the watchdog's no-progress clock, which a car waiting in traffic never runs, so
++-- a queue at the entrance is never culled. Real wedges still clear well before the watchdog.
++local STUCK_DESPAWN_TIME  = 15 -- s stalled (bugged) at the entrance, either direction, before we clear it
+ local _lastConnDespawnWarn = 0
+ -- True if this car should be cleared at an outside connection: it is either heading OUT
+ -- (left the city) or it has been wedged at the entrance too long (the recurring jam). Logs
+@@ -3394,12 +3463,12 @@
+ 		local dx, dz = pos.X - c.outer.X, pos.Z - c.outer.Z
+ 		local dist2 = dx * dx + dz * dz
+ 		local outward = look:Dot(c.normal) > 0.3
+-		-- Waiting at a red is not wedged, however long the cycle. Culling the head of the
++		-- Waiting in traffic is not wedged, however long the jam. Culling the head of the
+ 		-- queue there ate a busy entrance one car at a time, and the queue behind simply fed
+ 		-- the next victim forward -- which is most of what "cars keep despawning" looks like
+-		-- on a packed road. A genuinely stuck car is still cleared: the stall watchdog acts
+-		-- on no PROGRESS, which a working light ends.
+-		local wedged = (state.stuckTime or 0) >= STUCK_DESPAWN_TIME and state.stopReason ~= "redLight"
++		-- on a packed road. noProgressTime only runs while no traffic reason explains the
++		-- stop (waitingInTraffic), so only a bugged car is cleared here.
++		local wedged = (state.noProgressTime or 0) >= STUCK_DESPAWN_TIME
+ 		if (dist2 < CONN_DESPAWN_RADIUS * CONN_DESPAWN_RADIUS and outward)
+ 			or (dist2 < CONN_NEAR_RADIUS * CONN_NEAR_RADIUS and wedged) then
+ 			-- Only the wedged case is worth a line. A car pointing outward at a connection is
+@@ -3409,7 +3478,7 @@
+ 			if not outward and os.clock() - _lastConnDespawnWarn > 10 then
+ 				_lastConnDespawnWarn = os.clock()
+ 				warn(("[NPCDriverService] cleared WEDGED car at outside connection %s (stuck %.1fs, %.0f studs, reason=%s)")
+-					:format(tostring(c.id), state.stuckTime or 0, math.sqrt(dist2), tostring(state.stopReason)))
++					:format(tostring(c.id), state.noProgressTime or 0, math.sqrt(dist2), tostring(state.stopReason)))
+ 			end
+ 			return true
+ 		end
+--- a/PathFollower
++++ b/PathFollower
+@@ -179,15 +179,18 @@
+ -- Second return: heading dot of the nearest blocker vs our direction (nil when
+ -- nothing is ahead). Callers use it to tell a genuine queue (same direction,
+ -- will move) from a crossing/head-on standoff that can never clear by itself.
+-function PathFollower.getClearAhead(model: Model, pos: Vector3, dir: Vector3): (number, number?)
++-- Third return: the blocker itself, so a caller can tell two cars blocking EACH OTHER
++-- (a standoff no traffic can clear) from a car held by one that is stuck in the jam.
++function PathFollower.getClearAhead(model: Model, pos: Vector3, dir: Vector3): (number, number?, Model?)
+ 	local flatDir = Vector3.new(dir.X, 0, dir.Z)
+-	if flatDir.Magnitude < 1e-6 then return math.huge, nil end
++	if flatDir.Magnitude < 1e-6 then return math.huge, nil, nil end
+ 	flatDir = flatDir.Unit
+ 	local rightX, rightZ = -flatDir.Z, flatDir.X
+ 	local myHalf = halfLengthOf(model)
+ 	local nearestAhead = math.huge          -- centre distance of the closest car ahead
+ 	local nearestGap = math.huge            -- bumper gap to it (centre dist minus both half-lengths)
+ 	local nearestDot: number? = nil
++	local nearestCar: Model? = nil
+ 	local minCellX = math.floor((pos.X - SCAN_DIST) / SPATIAL_CELL_SIZE)
+ 	local maxCellX = math.floor((pos.X + SCAN_DIST) / SPATIAL_CELL_SIZE)
+ 	local minCellZ = math.floor((pos.Z - SCAN_DIST) / SPATIAL_CELL_SIZE)
+@@ -212,20 +215,22 @@
+ 				nearestAhead = ahead
+ 				nearestGap = ahead - myHalf - entry.half
+ 				nearestDot = sameDir
++				nearestCar = other
+ 			end
+ 		end
+ 	end
+-	return nearestGap, nearestDot
++	return nearestGap, nearestDot, nearestCar
+ end
+ 
+ -- 0..1 throttle factor based on the gap to the car ahead. Kept for callers that
+ -- only want to feather speed (CitizenService); NPCDriverService additionally uses
+ -- getForwardClearance as a hard travel clamp so cars can never overlap.
+-function PathFollower.getSpeedFactor(model: Model, pos: Vector3, dir: Vector3): number
+-	local gap = PathFollower.getClearAhead(model, pos, dir)
+-	if gap >= BRAKE_GAP then return 1 end
+-	if gap <= MIN_GAP then return 0 end
+-	return (gap - MIN_GAP) / (BRAKE_GAP - MIN_GAP)
++-- Second return: the car ahead, when it is close enough to slow us.
++function PathFollower.getSpeedFactor(model: Model, pos: Vector3, dir: Vector3): (number, Model?)
++	local gap, _, blocker = PathFollower.getClearAhead(model, pos, dir)
++	if gap >= BRAKE_GAP then return 1, nil end
++	if gap <= MIN_GAP then return 0, blocker end
++	return (gap - MIN_GAP) / (BRAKE_GAP - MIN_GAP), blocker
+ end
+ 
+ -- How far `model` may advance this frame before it would close to MIN_GAP behind
+@@ -239,13 +244,13 @@
+ 
+ -- NPCDriverService needs both values every tick. Compute the neighbor search once
+ -- instead of scanning the same nearby buckets twice.
+-function PathFollower.getMotionLimits(model: Model, pos: Vector3, dir: Vector3): (number, number, number?)
+-	local gap, blockerDot = PathFollower.getClearAhead(model, pos, dir)
+-	if gap == math.huge then return 1, math.huge, nil end
++function PathFollower.getMotionLimits(model: Model, pos: Vector3, dir: Vector3): (number, number, number?, Model?)
++	local gap, blockerDot, blocker = PathFollower.getClearAhead(model, pos, dir)
++	if gap == math.huge then return 1, math.huge, nil, nil end
+ 	local speedFactor = if gap >= BRAKE_GAP then 1
+ 		elseif gap <= MIN_GAP then 0
+ 		else (gap - MIN_GAP) / (BRAKE_GAP - MIN_GAP)
+-	return speedFactor, math.max(0, gap - MIN_GAP), blockerDot
++	return speedFactor, math.max(0, gap - MIN_GAP), blockerDot, blocker
+ end
+ 
+ local function getPlayerPositions(): { Vector3 }
+--- a/CitizenService
++++ b/CitizenService
+@@ -698,14 +698,19 @@
+ 		end
+ 		local total = t.cum[#t.cum]
+ 		local dir = if t.smoothCFrame then t.smoothCFrame.LookVector else Vector3.zAxis
+-		local factor = PathFollower.getSpeedFactor(car, car:GetPivot().Position, dir)
++		local factor, blocker = PathFollower.getSpeedFactor(car, car:GetPivot().Position, dir)
+ 		t.dist = math.min(total, t.dist + t.speed * dt * factor)
+-		-- Lot legs never wait at signals, so sustained zero progress means a mutual
+-		-- block (two cars nose-to-nose at a lot mouth, or wedged against a stalled
+-		-- road car). Skip to the leg's end so the trip continues -- these cars used
+-		-- to freeze at odd angles across the road forever.
++		-- Lot legs never wait at signals. Held by a car on the road network is traffic
++		-- (a queue across the driveway): wait for it like any jam. Sustained zero progress
++		-- with no such blocker means a mutual block (two cars nose-to-nose at a lot mouth):
++		-- skip to the leg's end so the trip continues -- these cars used to freeze at odd
++		-- angles across the road forever. A stalled road car is the traffic AI's to rescue.
+ 		if t.dist <= (t.lastDist or -1) + 1e-3 then
+-			t.stallTime = (t.stallTime or 0) + dt
++			if blocker and NPCDriverService.IsOnRoad(blocker) then
++				t.stallTime = 0
++			else
++				t.stallTime = (t.stallTime or 0) + dt
++			end
+ 			if (t.stallTime or 0) > TRIP_STALL_RESCUE then
+ 				t.dist = total
+ 			end
+@@ -1428,15 +1433,15 @@
+ 
+ -- A pocketed car comes back on the road only when that bit of road is clear, so it never
+ -- appears inside another car; `go` runs once it is out (or straight away if it was parked).
+-function Cars.fetchWhenClear(car: Model, go: () -> (), tries: number?)
++-- A jam over the spot holds it as long as the jam lasts, like any car waiting to pull out.
++function Cars.fetchWhenClear(car: Model, go: () -> ())
+ 	if not (Garage.folder and car.Parent == Garage.folder) then go(); return end
+-	local n = tries or 0
+-	if NPCDriverService.IsPointClear(car:GetPivot().Position, 10) or n >= 20 then
++	if NPCDriverService.IsPointClear(car:GetPivot().Position, 10) then
+ 		Garage.fetch(car)
+ 		go()
+ 		return
+ 	end
+-	task.delay(0.5, Cars.fetchWhenClear, car, go, n + 1)
++	task.delay(0.5, Cars.fetchWhenClear, car, go)
+ end
+ 
+ -- Studs from the nearest place this adult's car could be left to `toDoor`, as they would
+--- a/NPCDriverView
++++ b/NPCDriverView
+@@ -21,6 +21,7 @@
+ local Lighting          = game:GetService("Lighting")
+ 
+ local OCConstants = require(ReplicatedStorage.City.OutsideConnectionConstants)
++local RoadConstants = require(ReplicatedStorage.Road.RoadConstants)
+ local Settings = require(script.Parent.Parent.Core.Settings)
+ 
+ local NPCDriverView = {}
+@@ -81,6 +82,18 @@
+ -- server stopped sending is never left frozen on screen.
+ local FULL_DETAIL_DIST = 1000
+ local MID_SAMPLE_DIST = 2000
++-- Where the camera looks at the ground, reconstructed the way the server does from the
++-- camera report (NPCDriverService.Bind). The server streams by the nearer of the camera and
++-- this point; measuring from the camera alone hid half the cars on the very street being
++-- looked at whenever a high city camera put it past FULL_DETAIL_DIST.
++local function groundFocus(cf: CFrame): Vector3?
++	local look = cf.LookVector
++	if look.Y >= -0.05 then return nil end
++	local pos = cf.Position
++	local hit = pos + look * ((RoadConstants.getGroundY() - pos.Y) / look.Y)
++	local h = RoadConstants.MAP_HALF_EXTENT
++	return Vector3.new(math.clamp(hit.X, -h, h), hit.Y, math.clamp(hit.Z, -h, h))
++end
+ local function sampledOut(model: Model, flatSq: number, margin: number): boolean
+ 	if flatSq <= (FULL_DETAIL_DIST - margin) ^ 2 then return false end
+ 	local id = model:GetAttribute("NpcId")
+@@ -192,6 +205,7 @@
+ local _running = false
+ local _pxPerStud = 0     -- screen pixels per stud at 1 stud distance, refreshed every frame
+ local _camPos = Vector3.zero
++local _focus: Vector3? = nil -- camera's ground look-at point, refreshed every frame
+ 
+ local function setLamps(rig: Rig)
+ 	for _, sa in rig.lamps do
+@@ -351,6 +365,11 @@
+ 	local off = current.Position - camera.CFrame.Position
+ 	local forward = off:Dot(camera.CFrame.LookVector)
+ 	local flatSq = off.X * off.X + off.Z * off.Z
++	local focus = _focus
++	if focus then
++		local fx, fz = current.Position.X - focus.X, current.Position.Z - focus.Z
++		flatSq = math.min(flatSq, fx * fx + fz * fz)
++	end
+ 	local hidden = _hidden[model] == true
+ 	-- No stream pose yet: the replicated CFrame is where the vehicle was CREATED (the server
+ 	-- writes none after that), so drawing it would park a ghost at its spawn point.
+@@ -482,6 +501,7 @@
+ 	local camera = workspace.CurrentCamera
+ 	if camera then
+ 		_camPos = camera.CFrame.Position
++		_focus = groundFocus(camera.CFrame)
+ 		_pxPerStud = camera.ViewportSize.Y / (2 * math.tan(math.rad(camera.FieldOfView) * 0.5))
+ 		scanVisibility(camera)
+ 	end
