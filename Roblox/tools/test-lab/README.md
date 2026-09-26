@@ -17,7 +17,9 @@ test every fix in `../../pending-fixes/` before it ships.
   $CITY_LAB_DATA/fix*/new/...                     (patched files per batch, see shim/setup.luau)
   ```
 
-  Point `CITY_LAB_DATA` at that folder.
+  Point `CITY_LAB_DATA` at that folder. `zone_lab.luau` and the scenarios built on it also load
+  the building templates and nature models as `.rbxm` files from
+  `dump/ServerStorage/Templates` and `dump/ReplicatedStorage/Nature` (`shim/models.luau` reads them).
 
 ## Main scenarios
 
@@ -30,6 +32,14 @@ test every fix in `../../pending-fixes/` before it ships.
 | `t_s6_roundabout.luau <mode> <small\|medium\|large> <seed> <seconds> <cars/min/arm>` | traffic through a real RoadService roundabout |
 | `render_lab.luau <mode> <scene> <out.json>` then `python3 render/top.py out.json out.png cx cz half ppu` | top-down picture of what the road code builds |
 | `specrun.luau <mode>` | the project's own `.spec` modules |
+| `zone_lab.luau <mode> <street\|streethill\|corner\|cornerhill> <out.json>` | zones a street (flat or 1-in-8 hill, straight or with a 90-degree bend) with the real Plot/Building/LotDressing services and the place's templates, waits for construction, then measures how far each lot's ground sits above or below its floor. `ROWS=1` lists every lot, `DIAG=1` dumps the worst lot's ground and terrain-ledger owners |
+| `t_earth.luau <mode> streethill x` | one construction site: staged earthworks (ground height per step), its utility badge, build time |
+| `t_release.luau <mode> <scene> x` | bulldoze every house (and a site mid-earthworks): the ground must come back exactly, with no pad claims left |
+| `t_saveload.luau <mode> <scene> x` | PlotService save + load keeps every building (corner lots included) where it stood |
+| `t_cancel.luau <mode> street x` | bulldozing a site under construction frees its plot |
+| `t_cluster.luau <mode>` | utility badge clustering with a stand-in camera at three zoom levels |
+| `t_padbench.luau <mode>` | time to lay / bulldoze 400 building pads in a dense grid |
+| `render/view3d.py dump.json out.png cx cz [dist yaw pitch w h targetY]` | angled 3D render (Blender's `bpy` module, Cycles on the CPU) of a `zone_lab` dump plus its terrain |
 
-`<mode>`: `orig` = the place as sent; `fix4`, `fix5`, ... = with the pending batches overlaid
-(see `shim/setup.luau`). Table iteration order is not deterministic, so run several seeds.
+`<mode>`: `orig` = the place as sent; `fix4`, `fix5`, `fix6`, `fix7` = with the pending batches
+up to that one overlaid (see `shim/setup.luau`; `fix7` takes every file in `fix7/new`). Table iteration order is not deterministic, so run several seeds.

@@ -60,6 +60,11 @@ return function(Studio, root, file: string)
 			end
 		end
 	end
+	local bytes = 0
+	for _, d in root:GetDescendants() do
+		if d.ClassName == "StringValue" and d.Name == "RoadMeshSpecs" then bytes += #d.Value end
+	end
+	print("BLOBBYTES", bytes)
 	fs.writeFile(file, serde.encode("json", out))
 	return #out
 end

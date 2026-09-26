@@ -12,5 +12,6 @@ Apply batches oldest first; each builds on the one before:
 4. `2026-09-26-junction-rules`
 5. `2026-09-26-roundabouts`
 6. `2026-09-26-dashed-lines`
+7. `2026-09-26-buildings-terrain` (changes different scripts from 1-6, so it also works on its own)
 
 Preview images: `_previews/`.

@@ -22,6 +22,24 @@ return function(mode: string)
 		PATCHES["ServerScriptService.Services.NPC.NPCDriverService"] = D .. "/fix4/var/" .. mode:sub(5)
 		PATCHES["ServerScriptService.Services.Util.PathFollower"] = D .. "/fix4/new/PathFollower.luau"
 		mode = "fix4"
+	elseif mode == "fix6" or mode == "fix7" then
+		if mode == "fix7" then
+			-- batch 7 (buildings + terrain): every file in fix7/new, named by its Studio path
+			local fs = require("@lune/fs")
+			for _, f in fs.readDir(D .. "/fix7/new") do
+				if f:sub(-5) == ".luau" then PATCHES[f:sub(1, -6)] = D .. "/fix7/new/" .. f end
+			end
+		end
+		PATCHES["ServerScriptService.Services.NPC.NPCDriverService"] = D .. "/fix5/new/ServerScriptService.Services.NPC.NPCDriverService.luau"
+		for _, f in { "ReplicatedStorage.Road.RoadConstants", "ReplicatedStorage.Road.RoadSceneRenderer",
+			"ReplicatedStorage.Road.RoadNetwork", "ReplicatedStorage.Road.RoadTypes", "ReplicatedStorage.Networker",
+			"ServerScriptService.Services.Road.RoadSerializer", "ServerScriptService.Services.Road.RoadHistoryService",
+			"ServerScriptService.Services.Road.RoadService", "ServerScriptService.Services.Road.RoadReplicationService",
+			"ReplicatedStorage.Road.RoadNavigationGraph", "ReplicatedStorage.Road.IntersectionRenderer" } do
+			PATCHES[f] = D .. "/fix5/new/" .. f .. ".luau"
+		end
+		PATCHES["ReplicatedStorage.Road.RoadRenderer"] = D .. "/fix6/new/ReplicatedStorage.Road.RoadRenderer.luau"
+		mode = "fix4"
 	elseif mode == "fix5" or mode == "fix5dbg" or mode == "fix5noflare" then
 		local sub = if mode == "fix5dbg" then "dbg" elseif mode == "fix5noflare" then "noflare" else "new"
 		-- batch 5 (roundabouts) on top of batch 4

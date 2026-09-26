@@ -1,7 +1,8 @@
 # How to apply the City District fixes (step by step)
 
-There are six batches of fixes waiting in this folder. Apply them **in this order**,
-because each one builds on the one before:
+There are seven batches of fixes waiting in this folder. Apply them **in this order**,
+because each one builds on the one before (batch 7 changes different scripts, so it would
+also work on its own):
 
 | # | Folder | What it does |
 |---|---|---|
@@ -11,6 +12,7 @@ because each one builds on the one before:
 | 4 | `2026-09-26-junction-rules` | Junctions without lights take turns fairly; no cars inside each other in a junction |
 | 5 | `2026-09-26-roundabouts` | Roundabouts like the reference picture: brick apron, splitter islands, unbroken ring lines, centre presets |
 | 6 | `2026-09-26-dashed-lines` | Dashed lines line up where road pieces meet; no half dashes |
+| 7 | `2026-09-26-buildings-terrain` | Buildings never float over a ditch on hills, land between buildings is filled, corner lots at bends, realistic build times with visible earthworks, utility badges on construction sites, badges merge when zoomed out |
 
 Every batch folder has the same things inside:
 
@@ -65,8 +67,8 @@ Your local Claude is already connected to Studio, so it can edit the scripts dir
 5. If there are no errors, stop the playtest and **save** (File > Save to Roblox, or
    Ctrl+S). Then do the same for batch 2, with the folder name
    `2026-09-26-stock-and-time`, then batch 3 with `2026-09-26-visible-trips`, batch 4 with
-   `2026-09-26-junction-rules`, batch 5 with `2026-09-26-roundabouts`, and then batch 6 with
-   `2026-09-26-dashed-lines`.
+   `2026-09-26-junction-rules`, batch 5 with `2026-09-26-roundabouts`, batch 6 with
+   `2026-09-26-dashed-lines`, and then batch 7 with `2026-09-26-buildings-terrain`.
 
 Why one batch at a time: if something breaks, you know exactly which batch did it.
 
@@ -92,7 +94,7 @@ paste wins. After each batch: Play, check Output for red errors, then save.
 
 ## Step 3: playtest checklist
 
-After all six batches:
+After all seven batches:
 
 - **Clock:** a full day takes about 24 real minutes at 1x.
 - **Highway:** cars stay in their lane and keep their speed when they do change lanes.
@@ -104,6 +106,12 @@ After all six batches:
   lines all the way round. The new chip next to S/M/L picks the centre (Empty/Tree/Garden/
   Palms/Fountain); click inside a roundabout with the tool to apply it.
 - **Dashed lines:** even spacing straight through places where a road was drawn in pieces.
+- **Buildings on hills:** zone a street across a slope. Every house stands on flat ground with
+  no ditch or ledge under it, and the land between houses is smooth. Zoning up to a bend adds
+  a house on the outside corner.
+- **Construction:** the ground settles in a few steps when a lot is claimed; a house takes
+  about half a minute at 1x. Sites far from power show the lightning badge until you connect
+  them. Zoomed right out, badges merge into a few with counts.
 - **Far away:** zoom out and tilt the camera; the street you look at keeps all its cars.
 - **Shops/factories:** click one. "Sells/Produces: Stock" and how much it holds. Delivery
   trucks are rare (about twice a game week per shop) and bigger for bigger shops.

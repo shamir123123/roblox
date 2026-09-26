@@ -1,0 +1,1190 @@
+--- a/BuildingService
++++ b/BuildingService
+@@ -117,9 +117,24 @@
+ 	return householdCapFor(rec) * Const.FAMILY_MAX
+ end
+ 
+-local CONSTRUCTION_TIME  = 7
+-local CONSTRUCTION_SLOWDOWN = 1.2
+ local MIN_CONSTRUCTION_DURATION = 7
++-- How long a building takes to go up, in GAME-seconds (it holds at pause and runs at 2x/3x).
++-- It scales with the footprint the way real builds do -- a trailer goes up quicker than a
++-- shop -- but stays short enough that a street zoned now is lived in within the minute.
++-- It was a flat 8.4 s for everything.
++local BUILD_BASE_SECS     = 18
++local BUILD_SECS_PER_LOT  = 1.5 -- per lot of footprint area: a 3x3 house takes ~32 s
++local BUILD_MAX_SECS      = 60
++local BUILD_ZONE_FACTOR: { [string]: number } = { Residential = 1, Commercial = 1.2, Industrial = 1.3 }
++local BUILD_MEDIUM_FACTOR = 1.4 -- mid-rise blocks have more storeys to put up
++-- Earthworks: a claimed site is graded in steps before anything goes up, so the ground visibly
++-- settles into the pad (cut on the uphill side, filled on the downhill side) instead of
++-- snapping flat. Each step is a fraction of the way from the old ground to the finished pad.
++local EARTHWORK_STAGES    = { 0.25, 0.5, 0.75, 1 }
++local EARTHWORK_STEP_SECS = 0.9
++-- Construction sites carry the same utility badges as finished buildings (NoPowerView), so a
++-- player sees a street is off the grid while it is still going up, not after it moves in.
++local SITE_UTILITY_POLL   = 2 -- real seconds between re-checks of every site
+ local PLACE_DELAY_MIN    = 4
+ local PLACE_DELAY_MAX    = 9
+ 
+@@ -317,11 +332,18 @@
+ 
+ local finishConstructionVisual: (string) -> ()
+ 
+-local function playConstructionAnimation(blueprintId: string, pivot: CFrame, width: number, depth: number, onFinished: () -> ())
++-- Game-seconds a building of this zone and footprint (lots) takes to build.
++local function constructionSeconds(zone: string, w: number, d: number, density: string?): number
++	local secs = (BUILD_BASE_SECS + BUILD_SECS_PER_LOT * w * d) * (BUILD_ZONE_FACTOR[zone] or 1.2)
++	if density == "Medium" then secs *= BUILD_MEDIUM_FACTOR end
++	return math.clamp(secs, MIN_CONSTRUCTION_DURATION, BUILD_MAX_SECS)
++end
++
++local function playConstructionAnimation(blueprintId: string, pivot: CFrame, width: number, depth: number, onFinished: () -> (), duration: number?)
+ 	-- Duration is in GAME-seconds (no speed division): the scaled clock below and the
+ 	-- client animation both advance by dt*GameSpeed, so the build pauses at 0 and runs at
+ 	-- 2x/3x, and server completion stays in lockstep with the client visual.
+-	local constructionDuration = math.max(MIN_CONSTRUCTION_DURATION, CONSTRUCTION_TIME * CONSTRUCTION_SLOWDOWN)
++	local constructionDuration = math.max(MIN_CONSTRUCTION_DURATION, duration or MIN_CONSTRUCTION_DURATION)
+ 	local active = _activeConstruction[blueprintId]
+ 	local siteId = if active then active.siteId else blueprintId
+ 
+@@ -494,6 +516,93 @@
+ 	end
+ end
+ 
++-- ---- construction-site markers: the utility badges over a site ----------------------------
++-- One invisible, non-colliding box per site, the size of the frame that rises on it, in
++-- Workspace._City.ConstructionSites. NoPowerView watches that folder like ZonedBuildings, so
++-- the badge logic (and its clustering) is the same for a site as for a finished building.
++-- A utility is only checked once its service has reported on a finished building at least
++-- once (setPowered / setWatered / setDrained), so a site never shows a badge a house on the
++-- same spot would not.
++local _siteFolder: Folder? = nil
++local _siteMarkers: { [string]: Model } = {}
++local _utilityLive = { power = false, water = false, sewage = false }
++
++local function siteFolder(): Folder
++	local f = _siteFolder
++	if f and f.Parent then return f end
++	local made = ensureFolder(ensureFolder(Workspace, "_City"), "ConstructionSites")
++	_siteFolder = made
++	return made
++end
++
++local function requireService(name: string): any
++	local city = ServerScriptService:FindFirstChild("Services")
++	city = city and city:FindFirstChild("City")
++	local mod = city and city:FindFirstChild(name)
++	if not mod then return nil end
++	local ok, svc = pcall(require, mod)
++	return if ok then svc else nil
++end
++
++local function setFlag(m: Model, attr: string, on: boolean)
++	if m:GetAttribute(attr) ~= on then m:SetAttribute(attr, on) end
++end
++
++local function refreshSiteUtilities(bpId: string)
++	local m = _siteMarkers[bpId]
++	if not (m and m.Parent) then return end
++	local pos = (m:GetAttribute("SitePos") :: Vector3?) or m:GetPivot().Position
++	if _utilityLive.power then
++		local power = requireService("PowerService")
++		if power and power.isSuppliedAt then
++			local ok, supplied = pcall(power.isSuppliedAt, pos)
++			if ok then setFlag(m, "NoPower", not supplied) end
++		end
++	end
++	if _utilityLive.water or _utilityLive.sewage then
++		local water = requireService("WaterService")
++		if water and water.isServedAt then
++			if _utilityLive.water then
++				local ok, served = pcall(water.isServedAt, pos, "Water")
++				if ok then setFlag(m, "NoWater", not served) end
++			end
++			if _utilityLive.sewage then
++				local ok, served = pcall(water.isServedAt, pos, "Sewage")
++				if ok then setFlag(m, "NoSewage", not served) end
++			end
++		end
++	end
++end
++
++local function addSiteMarker(bpId: string, pivot: CFrame, w: number, d: number)
++	local h = math.clamp((w + d) * 1.45, 7, 14) -- the rising frame's height (ConstructionViewController)
++	local m = Instance.new("Model")
++	m.Name = "Site_" .. bpId
++	local box = Instance.new("Part")
++	box.Name = "SiteBounds"
++	box.Anchored = true
++	box.CanCollide = false
++	box.CanQuery = false
++	box.CanTouch = false
++	box.CastShadow = false
++	box.Transparency = 1
++	box.Size = Vector3.new(w * LOT_SIZE, h, d * LOT_SIZE)
++	box.CFrame = pivot * CFrame.new(0, h * 0.5, 0)
++	box.Parent = m
++	m.PrimaryPart = box
++	m:SetAttribute("BlueprintId", bpId)
++	m:SetAttribute("SitePos", pivot.Position)
++	m.Parent = siteFolder()
++	_siteMarkers[bpId] = m
++	refreshSiteUtilities(bpId)
++end
++
++local function removeSiteMarker(bpId: string)
++	local m = _siteMarkers[bpId]
++	_siteMarkers[bpId] = nil
++	if m then m:Destroy() end
++end
++
+ -- Hold a claimed lot as a nest for a demand-scaled dwell, then build. Demand only sets
+ -- the speed: +1 builds right after MIN_NEST_DWELL, -1 waits NEST_DWELL_RANGE on top.
+ -- Demand is re-read each poll so rising demand shortens a wait already in progress.
+@@ -519,11 +628,17 @@
+ 	end
+ end
+ 
++-- Declared ahead: cancelConstruction calls it, and it is defined further down. Without this
++-- the call resolved to a nil global, so bulldozing a site still under construction threw
++-- half-way and PlotService never heard the plot was free -- it stayed zoned for good.
++local fireBuildingRemoving: (string) -> ()
++
+ local function cancelConstruction(bpId: string)
+ 	local active = _activeConstruction[bpId]
+ 	if not active then return end
+ 	active.cancelled = true
+ 	_activeConstruction[bpId] = nil
++	removeSiteMarker(bpId)
+ 	finishConstructionVisual(active.siteId)
+ 	_plotFootprints[bpId] = nil
+ 	pcall(TerrainPadService.unpadFootprint, bpId)
+@@ -555,7 +670,7 @@
+ end
+ 
+ -- One bad listener must not abort a demolition half-way.
+-local function fireBuildingRemoving(bpId: string)
++function fireBuildingRemoving(bpId: string)
+ 	if _suppressRemoving then return end
+ 	for _, listener in _buildingRemovingListeners do
+ 		local ok, err = pcall(listener, bpId, _removeReason)
+@@ -680,9 +795,10 @@
+ 	local padW = math.max(padWidthStuds or 0, w * LOT_SIZE)
+ 	local padD = math.max(padDepthStuds or 0, d * LOT_SIZE)
+ 	local padPivot = pivot * CFrame.new(0, 0, (padD - d * LOT_SIZE) * 0.5)
+-	local function pad()
+-		pcall(TerrainPadService.padFootprint, bpId, padPivot, padW, padD, pivot.Position.Y)
++	local function pad(stage: number?)
++		pcall(TerrainPadService.padFootprint, bpId, padPivot, padW, padD, pivot.Position.Y, stage)
+ 	end
++	local buildSecs = constructionSeconds(zone, hw, hd, density)
+ 
+ 	local saveKey = saveKeyForPivot(zone, w, d, pivot)
+ 	-- A restore develops the same plots the save was taken from, so the state that
+@@ -691,6 +807,7 @@
+ 	_restoreState[saveKey] = nil
+ 
+ 	local function commit()
++		removeSiteMarker(bpId)
+ 		local level = if saved then saved.lv else 1
+ 		local lvFolder = if level > 1 then getTemplateFolder(zone, hw, hd, level, density) else folder
+ 		local pickFrom = lvFolder or folder
+@@ -721,9 +838,21 @@
+ 		return bpId
+ 	end
+ 
++	addSiteMarker(bpId, pivot, w, d)
+ 	task.spawn(function()
+-		pad()
+ 		showNest(bpId, pivot, w, d)
++		-- Earthworks first: the ground settles into the pad over a few steps. Checked right
++		-- before every write -- a site cancelled mid-grade has already released its pad, and
++		-- a late write would claim that ground again with nobody left to release it.
++		local function cancelled(): boolean
++			local a = _activeConstruction[bpId]
++			return not a or a.cancelled
++		end
++		for i, stage in EARTHWORK_STAGES do
++			if cancelled() then return end
++			pad(stage)
++			if i < #EARTHWORK_STAGES and not waitGameSeconds(EARTHWORK_STEP_SECS, cancelled) then return end
++		end
+ 		local proceed: boolean
+ 		if mode == "grow" then
+ 			proceed = waitForDemand(bpId, zone)
+@@ -734,7 +863,7 @@
+ 			end)
+ 		end
+ 		if not proceed then return end
+-		playConstructionAnimation(bpId, pivot, w, d, commit)
++		playConstructionAnimation(bpId, pivot, w, d, commit, buildSecs)
+ 	end)
+ 
+ 	return bpId
+@@ -914,6 +1043,7 @@
+ -- pass; the attribute is what NoPowerView hangs its icon off. Cosmetic state only -- the
+ -- grid itself is PowerService's, and abandonment goes through flagForAbandonment.
+ function BuildingService.setPowered(bpId: string, powered: boolean)
++	_utilityLive.power = true
+ 	local rec = _buildings[bpId]
+ 	if not rec then return end
+ 	rec.powered = powered
+@@ -928,6 +1058,7 @@
+ -- the badges off the attributes, and CitizenService reads the flags off listBuildings to
+ -- move families out of a home that goes without.
+ function BuildingService.setWatered(bpId: string, watered: boolean)
++	_utilityLive.water = true
+ 	local rec = _buildings[bpId]
+ 	if not rec then return end
+ 	rec.watered = watered
+@@ -937,6 +1068,7 @@
+ end
+ 
+ function BuildingService.setDrained(bpId: string, drained: boolean)
++	_utilityLive.sewage = true
+ 	local rec = _buildings[bpId]
+ 	if not rec then return end
+ 	rec.drained = drained
+@@ -1608,6 +1740,17 @@
+ 	end
+ end
+ 
+-function BuildingService.Start() end
++function BuildingService.Start()
++	-- Re-check the construction sites' utilities: a pole or a pipe laid while a street is
++	-- going up clears its badges without waiting for the houses to finish.
++	task.spawn(function()
++		while true do
++			task.wait(SITE_UTILITY_POLL)
++			for bpId in _siteMarkers do
++				refreshSiteUtilities(bpId)
++			end
++		end
++	end)
++end
+ 
+ return BuildingService
+\ No newline at end of file
+--- a/PlotService
++++ b/PlotService
+@@ -288,6 +288,104 @@
+ 	return free
+ end
+ 
++-- ---- corner lots -------------------------------------------------------------------------
++-- Cities: Skylines puts a building on the outside corner of a bend. The rows here stopped at
++-- the node and left that whole corner as bare grass. When a zoned row runs right up to a bend
++-- that turns AWAY from it, one more parcel carries the row on past the node: the row's depth,
++-- as wide as the parcel beside it (narrower if that is all that fits), its front facing the
++-- end of the road and the bend. TerrainPadService's gap fill grades the strip left between it
++-- and the row on the other road. The seat is stored with the group like any other (a zero-
++-- length slice at the row's end), so saves, loads and the bulldozer treat it the same.
++local CORNER_TURN_DOT = -0.5 -- the other road must turn at least ~30 deg away from the row
++
++local function flatUnit(v: Vector3): Vector3
++	local f = Vector3.new(v.X, 0, v.Z)
++	return if f.Magnitude < 1e-4 then Vector3.xAxis else f.Unit
++end
++
++-- The corner parcels past the row's node end, widest first (nil when this end is not the
++-- outside of a bend). `edge` is the row's parcel at that end.
++local function cornerCandidates(seg: any, side: number, atEnd: boolean, edge: PlotGeometry.Placement, minLots: number): { PlotGeometry.Placement }
++	local out: { PlotGeometry.Placement } = {}
++	if not _roadService or (side ~= 1 and side ~= -1) then return out end
++	local net = _roadService.getNetwork()
++	local nodeId = if atEnd then seg.endNode else seg.startNode
++	local node = nodeId and net:getNodes()[nodeId]
++	if not node or #node.segments ~= 2 then return out end -- a junction or a dead end
++	if net.getRoundaboutForNode and net:getRoundaboutForNode(nodeId) then return out end
++	local other = segmentById(if node.segments[1] == seg.id then node.segments[2] else node.segments[1])
++	if not other or other.id == seg.id then return out end
++	local otherAtEnd = other.endNode == nodeId
++
++	local tanHere = BezierUtil.tangent(seg.p0, seg.p1, seg.p2, seg.p3, if atEnd then 1 else 0)
++	local along = flatUnit(if atEnd then tanHere else -tanHere) -- carries the row on past the node
++	local tanOther = BezierUtil.tangent(other.p0, other.p1, other.p2, other.p3, if otherAtEnd then 1 else 0)
++	local away = flatUnit(if otherAtEnd then -tanOther else tanOther) -- the other road leaving the node
++	local inward = flatUnit(Vector3.new(-tanHere.Z, 0, tanHere.X) * side) -- toward the row's backyards
++	if inward:Dot(away) > CORNER_TURN_DOT then return out end -- the inside of the bend, or barely one
++
++	local plot = edge.plot
++	local front = if (plot.frontB - plot.frontA):Dot(along) >= 0 then plot.frontB else plot.frontA
++	local depth = plot.depth
++	local t = if atEnd then plot.t1 else plot.t0
++	local dLots = PlotGeometry.fitDepthLots(depth)
++	local idx = roadIndex()
++
++	-- Widest first: a parcel whose yard runs right out to where the other road's row ends
++	-- (its back line, at the same depth), so the corner is one lot rather than a lot and a
++	-- leftover strip. The building on it is as wide as a template gets and sits centred.
++	local sizes: { { number } } = {}
++	local otherIn = flatUnit(Vector3.new(-tanOther.Z, 0, tanOther.X))
++	if otherIn:Dot(along) < 0 then otherIn = -otherIn end -- the other road's outside: the corner
++	local reachOut = otherIn:Dot(along)
++	if reachOut > 0.2 then
++		local otherSide = if (Vector3.new(-tanOther.Z, 0, tanOther.X)):Dot(otherIn) > 0 then 1 else -1
++		local backLine = PlotGeometry.frontOffset(other.roadType, otherSide) + depth
++		local nodePos = if atEnd then seg.p3 else seg.p0
++		local W = (backLine - Vector3.new(front.X - nodePos.X, 0, front.Z - nodePos.Z):Dot(otherIn)) / reachOut
++		local lots = math.min(5, math.floor(W / LOT + 1e-3))
++		if lots >= minLots and W <= 7 * LOT then table.insert(sizes, { W, lots }) end
++	end
++	for lots = math.max(edge.parcelLots, minLots), minLots, -1 do
++		table.insert(sizes, { lots * LOT, lots })
++	end
++
++	for _, size in sizes do
++		local W, lots = size[1], size[2]
++		local fA, fB = front, front + along * W
++		local cp: PlotGeometry.Plot = {
++			frontA = fA, frontB = fB, backB = fB + inward * depth, backA = fA + inward * depth,
++			center = fA + along * (W * 0.5) + inward * (depth * 0.5),
++			frontage = W, depth = depth, angleDeg = math.deg(math.atan2(along.X, along.Z)),
++			t0 = t, t1 = t,
++		}
++		local pivot, corners = PlotGeometry.buildingRect(cp, lots, dLots)
++		if not PlotGeometry.buildingBlocked(idx, corners, seg.id)
++			and not PlotGeometry.rectOnRoad(idx, { cp.frontA, cp.frontB, cp.backB, cp.backA }, seg.id) then
++			table.insert(out, { plot = cp, segId = seg.id, side = side, parcelLots = lots, w = lots, d = dLots,
++				pivot = pivot, corners = corners, blocked = false } :: any)
++		end
++	end
++	return out
++end
++
++-- Try the corner lot at one end of a freshly developed row; adds its seat to the group.
++local function developCorner(g: PlotGroup, seg: any, atEnd: boolean, edge: PlotGeometry.Placement, mode: string)
++	if not _building or not g.placed then return end
++	local minLots = if g.zone == "Residential" and not g.density then PlotGeometry.MIN_HOUSE_LOTS else 2
++	for _, pl in cornerCandidates(seg, g.side, atEnd, edge, minLots) do
++		local pivot = seatPivot(pl.pivot)
++		local fw, fd = r1(pl.plot.frontage), r1(pl.plot.depth)
++		local bpId = _building.developPlot(pivot, g.zone, pl.w, pl.d, mode, g.segmentId, g.building, fw, fd, g.density)
++		if bpId then
++			table.insert(g.buildingIds, bpId)
++			table.insert(g.placed, { pivot = pivot, w = pl.w, d = pl.d, fw = fw, fd = fd, bpId = bpId,
++				t0 = pl.plot.t0, t1 = pl.plot.t1 })
++			return
++		end
++	end
++end
++
+ -- Full snapshot to a joining player (or everyone after a restore).
+ function PlotService.broadcastFull(target: Player?)
+ 	if not _net then return end
+@@ -423,6 +521,10 @@
+ 		-- overlap on a curve, junction wrap) splits the span instead of claiming frontage
+ 		-- nothing was built on.
+ 		local run: { PlotGeometry.Placement } = {}
++		-- Where this side's zonable frontage starts and ends: a row reaching either is at the
++		-- node, and may carry on round the outside of a bend (developCorner).
++		local loT: number?, hiT: number? = nil, nil
++		if not isCap then loT, hiT = PlotGeometry.clampSpan(idx, seg, 0, 1, side) end
+ 		local function flushRun()
+ 			if #run == 0 then return end
+ 			_nextId += 1
+@@ -433,6 +535,10 @@
+ 				zone = zone, building = building, density = density, buildingIds = {},
+ 			}
+ 			if developGroup(g, mode, run) > 0 then
++				if loT and hiT and not uniform and not building then
++					if run[#run].plot.t1 >= hiT - 1e-3 then developCorner(g, seg, true, run[#run], mode) end
++					if run[1].plot.t0 <= loT + 1e-3 then developCorner(g, seg, false, run[1], mode) end
++				end
+ 				_groups[g.id] = g
+ 				created[#created + 1] = toWire(g)
+ 				table.insert(batchExtra[key], { g.t0, g.t1 })
+--- a/TerrainOverlayLedger
++++ b/TerrainOverlayLedger
+@@ -7,10 +7,18 @@
+ -- releases.
+ --
+ -- Merge rules (order-independent):
+---   height = min(locked owners), else min(every target)
++--   height = min(locked owners of the highest priority), else min(soft owners of the
++--            highest priority)
+ --   flags  = origFlags | OR(owner contributions) -- locked while ANY owner locks
+ -- A locked slab is a hard surface. It must not be pulled down by another
+ -- system's soft shoulder in the same corner.
++-- Priority is optional per claim. Roads never pass one, so they merge exactly as before:
++-- a locked claim without one ranks above every locked claim that has one, and a soft
++-- claim without one ranks 0. A pad's locked ground passes how deep the corner lies
++-- inside its own plot (negative outside it), so between two buildings each corner
++-- belongs to the lot it is in: the next lot's edge can no longer cut a trench into this
++-- one. A pad's soft gap fill passes a positive priority, so it beats the plain slopes
++-- (road banks, pad shoulders) there without locking the ground against a later road.
+ -- Original height/flags are snapshotted when the first owner claims a corner;
+ -- releases with surviving owners recompute the merge from the survivors.
+ --
+@@ -33,6 +41,7 @@
+ 	origFlags: number,
+ 	targets: { [string]: number }, -- per-owner target raw height
+ 	flags: { [string]: number }, -- per-owner flag contribution
++	prio: { [string]: number }, -- per-owner merge priority (absent: top if locked, 0 if soft)
+ 	count: number,
+ }
+ 
+@@ -65,16 +74,21 @@
+ -- Recompute and write one corner's effective height/flags from all its owners.
+ function TerrainOverlayLedger._apply(self: TerrainOverlayLedger, key: number, e: CornerEntry, markDirty: boolean?)
+ 	local effRaw = math.huge
++	local effPrio = -math.huge
+ 	for owner, raw in e.targets do
+ 		local flags = e.flags[owner] or 0
+-		if bit32.band(flags, FLAG_LOCKED) ~= 0 and raw < effRaw then
+-			effRaw = raw
++		if bit32.band(flags, FLAG_LOCKED) ~= 0 then
++			local p = e.prio[owner] or math.huge
++			if p > effPrio or (p == effPrio and raw < effRaw) then
++				effPrio, effRaw = p, raw
++			end
+ 		end
+ 	end
+ 	if effRaw == math.huge then
+-		for _, raw in e.targets do
+-			if raw < effRaw then
+-				effRaw = raw
++		for owner, raw in e.targets do
++			local p = e.prio[owner] or 0
++			if p > effPrio or (p == effPrio and raw < effRaw) then
++				effPrio, effRaw = p, raw
+ 			end
+ 		end
+ 	end
+@@ -128,12 +142,15 @@
+ end
+ 
+ -- Target height claimed by an owner kind at this corner. Pads use this to make a
+--- short, road-facing join without changing the road's locked terrain.
+-function TerrainOverlayLedger.targetForOwnerKind(self: TerrainOverlayLedger, gx: number, gz: number, kindPrefix: string): number?
++-- short, road-facing join without changing the road's locked terrain. With
++-- `requireFlags`, only a claim carrying all of those flag bits counts (a road's
++-- LOCKED bed, not the soft bank that blends it back to natural ground).
++function TerrainOverlayLedger.targetForOwnerKind(self: TerrainOverlayLedger, gx: number, gz: number, kindPrefix: string, requireFlags: number?): number?
+ 	local e = self._corners[cornerKey(gx, gz)]
+ 	if not e then return nil end
+ 	for owner, raw in e.targets do
+-		if string.sub(owner, 1, #kindPrefix) == kindPrefix then
++		if string.sub(owner, 1, #kindPrefix) == kindPrefix
++			and (requireFlags == nil or bit32.band(e.flags[owner] or 0, requireFlags) == requireFlags) then
+ 			return raw
+ 		end
+ 	end
+@@ -142,8 +159,9 @@
+ 
+ -- Record `owner`'s claim on a corner and apply the merged result. Requires a
+ -- prior beginOwner. Writing the same corner twice for one owner just updates
+--- that owner's target.
+-function TerrainOverlayLedger.write(self: TerrainOverlayLedger, owner: string, gx: number, gz: number, targetRaw: number, flagBits: number)
++-- that owner's target. `priority` ranks this claim against others of the same kind
++-- (locked or soft; see the merge rules at the top). Leave it out to rank with the roads.
++function TerrainOverlayLedger.write(self: TerrainOverlayLedger, owner: string, gx: number, gz: number, targetRaw: number, flagBits: number, priority: number?)
+ 	local touched = self._owners[owner]
+ 	if not touched then
+ 		error(`[TerrainOverlayLedger] write before beginOwner for {owner}`)
+@@ -156,6 +174,7 @@
+ 			origFlags = self._hm:getFlags(gx, gz),
+ 			targets = {},
+ 			flags = {},
++			prio = {},
+ 			count = 0,
+ 		}
+ 		self._corners[key] = e
+@@ -166,6 +185,7 @@
+ 	end
+ 	e.targets[owner] = targetRaw
+ 	e.flags[owner] = flagBits
++	e.prio[owner] = priority
+ 	self:_apply(key, e)
+ end
+ 
+@@ -182,6 +202,7 @@
+ 		if e and e.targets[owner] ~= nil then
+ 			e.targets[owner] = nil
+ 			e.flags[owner] = nil
++			e.prio[owner] = nil
+ 			e.count -= 1
+ 			if e.count <= 0 then
+ 				self._corners[key] = nil
+--- a/TerrainPadService
++++ b/TerrainPadService
+@@ -27,6 +27,11 @@
+ local SHOULDER_MAX     = 14.0
+ local MAX_GRADE        = 0.75 -- max rise/run of the ordinary lot edge (~37 deg)
+ local ROAD_JOIN_MAX    = 10.0 -- only bridge genuinely small road-to-lot gaps
++-- Gap fill (see fillPair): lots whose plots come this close get the ground between them
++-- graded from one lot's level to the other's.
++local FILL_GAP_MAX     = 32.0
++local FILL_PRIORITY    = 1    -- soft-claim rank of a fill; road banks and pad shoulders rank 0
++local FACING_DOT       = -0.7 -- lots facing each other this squarely are across a street
+ -- TerrainDataService.getSurfaceY is the visible terrain height: raw height plus this
+ -- renderer offset. Writing the pad at baseY - RENDER_BULGE makes its visible surface
+ -- exactly meet the building base instead of leaving the former 0.5-stud air gap.
+@@ -63,7 +68,10 @@
+ 			local rx = math.clamp(gx + dx, 0, MAX_CORNER)
+ 			-- One prefix: segments and corner connectors both claim under "road:" now (see
+ 			-- TerrainGradeService.ROAD_KIND -- splitting them was burying carriageways).
+-			local raw = led:targetForOwnerKind(rx, rz, "road:")
++			-- Only the road's LOCKED bed is the road. Its soft bank runs 16 studs out at
++			-- natural-ground height; joining to that on a hillside copied the bank's height
++			-- into a locked strip that cut a trench through the next lot along.
++			local raw = led:targetForOwnerKind(rx, rz, "road:", FLAG_LOCKED)
+ 			if raw then
+ 				local roadX = cornerToWorld(rx)
+ 				local deltaX = roadX - wx
+@@ -80,18 +88,232 @@
+ 	return nearestY, nearestDist
+ end
+ 
+--- Flatten the terrain under one building footprint. Idempotent per id.
+--- pivot is the horizontal footprint frame: RightVector spans worldWidth and
+--- LookVector spans worldDepth. baseY is the height the pad is flattened to.
+-function TerrainPadService.padFootprint(id: string, pivot: CFrame, worldWidth: number, worldDepth: number, baseY: number)
+-	local led = ledger()
+-	if not led or not led:beginOwner("pad:" .. id) then return end -- already padded
++-- ---- neighbours: the pads that are standing, for the gap fill --------------------------
++-- Every pad is registered with the footprint it was given, so a lot can find the lots beside
++-- it and fill the ground between them (see fillPair). A 64-stud spatial hash keeps that
++-- lookup local on a city of thousands of buildings.
++-- fillWith: the pads this one wrote a gap fill toward. Those fills belong to THIS pad (its
++-- "pad:<id>#fill" owner), so when one of those neighbours goes or moves, this pad redoes them.
++-- px..fz: the pivot's position and flat axes as plain numbers, for the per-corner maths.
++type PadRec = {
++	pivot: CFrame, w: number, d: number, baseY: number, stage: number, fillWith: { [string]: boolean },
++	px: number, pz: number, rx: number, rz: number, fx: number, fz: number,
++}
++local _pads: { [string]: PadRec } = {}
++local _cells: { [number]: { [string]: boolean } } = {}
++local CELL = 64
++
++local function padBounds(rec: PadRec, grow: number): (number, number, number, number)
++	local r = math.sqrt(rec.w * rec.w + rec.d * rec.d) * 0.5 + grow
++	return rec.px - r, rec.px + r, rec.pz - r, rec.pz + r
++end
++
++local function forCells(x0: number, x1: number, z0: number, z1: number, fn: (number) -> ())
++	for cz = math.floor(z0 / CELL), math.floor(z1 / CELL) do
++		for cx = math.floor(x0 / CELL), math.floor(x1 / CELL) do
++			fn(cz * 65536 + cx)
++		end
++	end
++end
++
++local function register(id: string, rec: PadRec)
++	_pads[id] = rec
++	local x0, x1, z0, z1 = padBounds(rec, 0)
++	forCells(x0, x1, z0, z1, function(k)
++		local c = _cells[k]
++		if not c then
++			c = {}
++			_cells[k] = c
++		end
++		c[id] = true
++	end)
++end
++
++local function unregister(id: string)
++	local rec = _pads[id]
++	if not rec then return end
++	_pads[id] = nil
++	local x0, x1, z0, z1 = padBounds(rec, 0)
++	forCells(x0, x1, z0, z1, function(k)
++		local c = _cells[k]
++		if c then
++			c[id] = nil
++			if next(c) == nil then _cells[k] = nil end
++		end
++	end)
++end
++
++-- Ids of the pads whose plots come within `grow` studs of this one's bounds.
++local function nearbyPads(id: string, rec: PadRec, grow: number): { string }
++	local seen: { [string]: boolean } = {}
++	local out: { string } = {}
++	local x0, x1, z0, z1 = padBounds(rec, grow)
++	forCells(x0, x1, z0, z1, function(k)
++		local c = _cells[k]
++		if not c then return end
++		for other in c do
++			if other ~= id and not seen[other] then
++				seen[other] = true
++				table.insert(out, other)
++			end
++		end
++	end)
++	table.sort(out) -- deterministic order: the same city pads the same way every time
++	return out
++end
++
++-- Distance on XZ from a point to a pad's plot rectangle (0 inside it).
++local function rectDist(rec: PadRec, x: number, z: number): number
++	local dx, dz = x - rec.px, z - rec.pz
++	local du = math.max(0, math.abs(dx * rec.rx + dz * rec.rz) - rec.w * 0.5)
++	local dv = math.max(0, math.abs(dx * rec.fx + dz * rec.fz) - rec.d * 0.5)
++	return math.sqrt(du * du + dv * dv)
++end
++
++local function rectCorners(rec: PadRec): { Vector3 }
++	local out: { Vector3 } = {}
++	local hw, hd = rec.w * 0.5, rec.d * 0.5
++	for _, c in { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } } do
++		local u, v = c[1] * hw, c[2] * hd
++		table.insert(out, Vector3.new(rec.px + rec.rx * u + rec.fx * v, 0, rec.pz + rec.rz * u + rec.fz * v))
++	end
++	return out
++end
+ 
++-- Counter-clockwise convex hull on XZ (monotone chain).
++local function hull(pts: { Vector3 }): { Vector3 }
++	table.sort(pts, function(a, b) return a.X < b.X or (a.X == b.X and a.Z < b.Z) end)
++	local function cross(o: Vector3, a: Vector3, b: Vector3): number
++		return (a.X - o.X) * (b.Z - o.Z) - (a.Z - o.Z) * (b.X - o.X)
++	end
++	local lower: { Vector3 }, upper: { Vector3 } = {}, {}
++	for _, p in pts do
++		while #lower >= 2 and cross(lower[#lower - 1], lower[#lower], p) <= 0 do table.remove(lower) end
++		table.insert(lower, p)
++	end
++	for i = #pts, 1, -1 do
++		local p = pts[i]
++		while #upper >= 2 and cross(upper[#upper - 1], upper[#upper], p) <= 0 do table.remove(upper) end
++		table.insert(upper, p)
++	end
++	table.remove(lower)
++	table.remove(upper)
++	for _, p in upper do table.insert(lower, p) end
++	return lower
++end
++
++local function inHull(h: { Vector3 }, x: number, z: number): boolean
++	local n = #h
++	if n < 3 then return false end
++	for i = 1, n do
++		local a, b = h[i], h[i % n + 1]
++		if (b.X - a.X) * (z - a.Z) - (b.Z - a.Z) * (x - a.X) < -1e-6 then return false end
++	end
++	return true
++end
++
++-- The fill between two lots: the ground inside the convex hull of both plots that neither
++-- plot covers -- the square left at the outside of a bend, the corner beside a junction, the
++-- wedge behind lots on a curve, the strip between two backyards. It runs smoothly from one
++-- lot's level to the other's instead of dipping to natural ground and back, so the space
++-- between buildings reads as one piece of graded land (Cities: Skylines' "no floating, no
++-- pits"). Two lots facing each other across a street are not neighbours: the street is
++-- between them, not a gap -- caught by their facing, and for pads whose facing says nothing
++-- (a school, a bus stop) by a road bed on the line between their centres. Writes the best
++-- claim per corner into `out`.
++type FillClaim = { gx: number, gz: number, raw: number, prio: number }
++local function fillPair(led: any, a: PadRec, b: PadRec, out: { [number]: FillClaim }): boolean
++	local sx, sz = b.px - a.px, b.pz - a.pz
++	local ahead = sx * a.fx + sz * a.fz
++	if a.fx * b.fx + a.fz * b.fz < FACING_DOT and ahead > 0 then return false end
++
++	local ca, cb = rectCorners(a), rectCorners(b)
++	local gap = math.huge
++	for _, c in ca do gap = math.min(gap, rectDist(b, c.X, c.Z)) end
++	for _, c in cb do gap = math.min(gap, rectDist(a, c.X, c.Z)) end
++	if gap > FILL_GAP_MAX then return false end
++
++	local steps = math.ceil(math.sqrt(sx * sx + sz * sz) / 2)
++	for i = 1, steps - 1 do
++		local f = i / steps
++		local gx = math.clamp(math.floor(worldToCorner(a.px + sx * f) + 0.5), 0, MAX_CORNER)
++		local gz = math.clamp(math.floor(worldToCorner(a.pz + sz * f) + 0.5), 0, MAX_CORNER)
++		if led:lockedByOtherKind(gx, gz, "pad:") then return false end -- a road runs between them
++	end
++
++	local pts = table.clone(ca)
++	for _, c in cb do table.insert(pts, c) end
++	local h = hull(pts)
++	local x0, x1, z0, z1 = math.huge, -math.huge, math.huge, -math.huge
++	for _, p in h do
++		x0, x1 = math.min(x0, p.X), math.max(x1, p.X)
++		z0, z1 = math.min(z0, p.Z), math.max(z1, p.Z)
++	end
++	local ya, yb = a.baseY - PAVE_CLEARANCE, b.baseY - PAVE_CLEARANCE
++	local wrote = false
++	for gz = math.clamp(math.floor(worldToCorner(z0)), 0, MAX_CORNER), math.clamp(math.ceil(worldToCorner(z1)), 0, MAX_CORNER) do
++		local wz = cornerToWorld(gz)
++		for gx = math.clamp(math.floor(worldToCorner(x0)), 0, MAX_CORNER), math.clamp(math.ceil(worldToCorner(x1)), 0, MAX_CORNER) do
++			local wx = cornerToWorld(gx)
++			if not inHull(h, wx, wz) then continue end
++			local da, db = rectDist(a, wx, wz), rectDist(b, wx, wz)
++			if da <= 0 or db <= 0 then continue end -- a plot's own pad covers it
++			if led:lockedByOtherKind(gx, gz, "pad:") then continue end -- a road bed
++			local t = da / (da + db)
++			local y = ya + (yb - ya) * (t * t * (3 - 2 * t))
++			-- The tighter pair wins a corner two fills both reach.
++			local prio = FILL_PRIORITY + 1 / (1 + da + db)
++			local key = gz * CORNERS_PER_AXIS + gx
++			local cur = out[key]
++			if not cur or cur.prio < prio then
++				out[key] = { gx = gx, gz = gz, raw = worldYToRaw(y), prio = prio }
++			end
++			wrote = true
++		end
++	end
++	return wrote
++end
++
++-- (Re)write one pad's gap fills, under its own owner so they can be redone without touching
++-- the pad. They are soft claims that outrank the plain slopes; the lots' own locked ground
++-- outranks them, so they only ever shape the land between lots. A site still under
++-- construction joins in once its earthworks finish.
++local function applyFills(led: any, id: string, rec: PadRec)
++	local owner = "pad:" .. id .. "#fill"
++	led:release(owner)
++	rec.fillWith = {}
++	if rec.stage < 1 then return end
++	local fills: { [number]: FillClaim } = {}
++	for _, other in nearbyPads(id, rec, FILL_GAP_MAX) do
++		local o = _pads[other]
++		if o and o.stage >= 1 and fillPair(led, rec, o, fills) then
++			rec.fillWith[other] = true
++		end
++	end
++	if next(fills) == nil then return end
++	led:beginOwner(owner)
++	for _, f in fills do
++		led:write(owner, f.gx, f.gz, f.raw, FLAG_PAD_GRADED, f.prio)
++	end
++end
++
++-- Write one pad (release first if it is already down), then its gap fills. `rec.stage` in
++-- 0..1 is how far the earthworks have got: every corner sits that fraction of the way from
++-- the ground it found to its finished height, so a construction site settles in a few steps
++-- instead of snapping.
++local function applyPad(led: any, id: string, rec: PadRec)
++	local owner = "pad:" .. id
++	led:release(owner)
++	led:release(owner .. "#fill")
++	led:beginOwner(owner)
++
++	local pivot, worldWidth, worldDepth, baseY, stage = rec.pivot, rec.w, rec.d, rec.baseY, rec.stage
+ 	local center = pivot.Position
+ 	local right  = pivot.RightVector
+ 	local fwd    = pivot.LookVector
+ 	local halfW  = worldWidth * 0.5 + FOOTPRINT_MARGIN
+ 	local halfD  = worldDepth * 0.5 + FOOTPRINT_MARGIN
++	local plotHalfW, plotHalfD = worldWidth * 0.5, worldDepth * 0.5
+ 	local reach  = FLAT_VERGE + SHOULDER_MAX -- widest a grade-limited shoulder can run
+ 	local rad    = math.max(halfW, halfD) + reach
+ 
+@@ -111,6 +333,12 @@
+ 			local du = math.max(0, math.abs(u) - halfW)
+ 			local dv = math.max(0, math.abs(v) - halfD)
+ 			local d = math.sqrt(du * du + dv * dv) -- 0 inside the footprint
++			-- How deep this corner lies inside the plot (negative outside it). Where two lots'
++			-- locked claims meet, the ledger gives the corner to the lot it is deeper in, so a
++			-- lot's own ground always wins over the next lot's verge.
++			local pu, pv = math.abs(u) - plotHalfW, math.abs(v) - plotHalfD
++			local depthIn = if pu <= 0 and pv <= 0 then math.min(-pu, -pv)
++				else -math.sqrt(math.max(pu, 0) ^ 2 + math.max(pv, 0) ^ 2)
+ 
+ 			if d <= reach then
+ 				-- Never fight terrain another system owns (e.g. a road's flat bed):
+@@ -129,6 +357,7 @@
+ 				local refY = if math.abs(currentY - padY) < math.abs(naturalY - padY) then currentY else naturalY
+ 				local newY: number
+ 				local flags: number
++				local prio: number? = depthIn
+ 				local joinedRoad = false
+ 
+ 				if d > 0 and d <= ROAD_JOIN_MAX then
+@@ -163,21 +392,79 @@
+ 						local s = t * t * (3 - 2 * t)
+ 						newY = padY + (refY - padY) * s
+ 						flags = FLAG_PAD_GRADED
++						prio = nil -- a plain slope: merges by min with the road banks, as before
+ 					end
+ 				end
+-				led:write("pad:" .. id, gx, gz, worldYToRaw(newY), flags)
++				if stage < 1 then newY = currentY + (newY - currentY) * stage end
++				led:write(owner, gx, gz, worldYToRaw(newY), flags, prio)
+ 			end
+ 		end
+ 	end
++
++	applyFills(led, id, rec)
+ end
+ 
+--- Release one building's pad. Corners drop back to their pre-pad height + flags
+--- once no pad owns them.
++-- Flatten the terrain under one building footprint. pivot is the horizontal footprint
++-- frame: RightVector spans worldWidth and LookVector spans worldDepth (LookVector faces
++-- the road). baseY is the height the pad is flattened to. `stage` (default 1) is how far
++-- the earthworks have got; calling again with a later stage moves the ground on. Calling
++-- again with the same arguments does nothing.
++function TerrainPadService.padFootprint(id: string, pivot: CFrame, worldWidth: number, worldDepth: number, baseY: number, stage: number?)
++	local led = ledger()
++	if not led then return end
++	local st = math.clamp(stage or 1, 0, 1)
++	local cur = _pads[id]
++	if cur and led:isOwned("pad:" .. id) and cur.stage == st and cur.baseY == baseY
++		and cur.w == worldWidth and cur.d == worldDepth
++		and (cur.pivot.Position - pivot.Position).Magnitude < 1e-3
++		and cur.pivot.LookVector:Dot(pivot.LookVector) > 0.99999 then
++		return -- already padded exactly like this
++	end
++	if cur then unregister(id) end
++	local p, r, f = pivot.Position, pivot.RightVector, pivot.LookVector
++	local rec: PadRec = {
++		pivot = pivot, w = worldWidth, d = worldDepth, baseY = baseY, stage = st, fillWith = {},
++		px = p.X, pz = p.Z, rx = r.X, rz = r.Z, fx = f.X, fz = f.Z,
++	}
++	register(id, rec)
++	applyPad(led, id, rec)
++	-- A pad that was already down and has changed: the fills its neighbours wrote toward it
++	-- were shaped to the old one.
++	if cur then
++		for _, other in nearbyPads(id, rec, FILL_GAP_MAX + math.sqrt(cur.w * cur.w + cur.d * cur.d)) do
++			local o = _pads[other]
++			if o and o.fillWith[id] and led:isOwned("pad:" .. other) then applyFills(led, other, o) end
++		end
++	end
++end
++
++-- Release one building's pad. Corners drop back to their pre-pad height + flags once no
++-- pad owns them, and the finished lots beside it redo their gap fills without it (a fill a
++-- neighbour wrote toward this lot would otherwise outlive it).
+ function TerrainPadService.unpadFootprint(id: string)
+ 	local led = ledger()
+-	if led then
+-		led:release("pad:" .. id)
++	if not led then return end
++	led:release("pad:" .. id)
++	led:release("pad:" .. id .. "#fill")
++	local rec = _pads[id]
++	if not rec then return end
++	local near = nearbyPads(id, rec, FILL_GAP_MAX)
++	unregister(id)
++	for _, other in near do
++		local o = _pads[other]
++		if not o then continue end
++		if not led:isOwned("pad:" .. other) then
++			unregister(other) -- the ledger was cleared under it (a new map): nothing to redo
++		elseif o.fillWith[id] then
++			applyFills(led, other, o) -- only the ones that wrote a fill toward this pad
++		end
+ 	end
+ end
+ 
++-- The earthworks stage a pad was last written at (nil = no pad).
++function TerrainPadService.getStage(id: string): number?
++	local rec = _pads[id]
++	return rec and rec.stage
++end
++
+ return TerrainPadService
+--- a/NoPowerView
++++ b/NoPowerView
+@@ -15,11 +15,19 @@
+ -- All of them PULSE -- a badge that just sits there is furniture, and a player scanning a
+ -- city block reads movement long before they read an icon.
+ --
++-- Construction sites carry the same attributes (BuildingService stamps a marker per site),
++-- so a street that is off the grid says so while it is still going up.
++--
++-- Zoomed out, badges of the same kind that crowd together on screen fold into ONE bigger
++-- badge with a count, like Cities: Skylines II's notification icons: a dark suburb reads as
++-- "bolt x40", not forty bolts piled on top of each other. Zoom in and they split again.
++--
+ -- Purely cosmetic. Families leaving a home that goes without is CitizenService's call,
+ -- off the same flags, not anything here.
+ 
+ local Workspace = game:GetService("Workspace")
+ local TweenService = game:GetService("TweenService")
++local RunService = game:GetService("RunService")
+ 
+ local uiFolder = script.Parent.Parent:WaitForChild("UI")
+ local Theme = require(uiFolder:WaitForChild("Theme"))
+@@ -36,6 +44,14 @@
+ 
+ local ABANDONED_COLOR = Color3.fromRGB(58, 54, 50)
+ 
++-- Clustering (see the header). Screen-space, so it follows the zoom by itself: the same two
++-- houses are one badge from high up and two from street level.
++local CLUSTER_PX = 40            -- badges of one kind closer than this on screen merge
++local CLUSTER_MIN_DIST = 150     -- studs from the camera; nearer than this every badge stands alone
++local CLUSTER_MAX_DISTANCE = 2400 -- a cluster still shows this far out (a lone badge stops at MAX_DISTANCE)
++local CLUSTER_EVERY = 0.25       -- seconds between re-clusterings
++local CLUSTER_BADGE = 34
++
+ -- The attributes, in the order they beat each other, with the badge each one draws.
+ local STATES = {
+ 	{ attr = "Abandoned", color = ABANDONED_COLOR,                glyph = "\u{2715}" },
+@@ -52,6 +68,7 @@
+ 	PowerLines = true,     -- poles wired to no generator
+ 	EmergencyServices = true, -- pumps and treatment plants the grid did not reach
+ 	PipeEnds = true,       -- mains that stop in the middle of nowhere
++	ConstructionSites = true, -- buildings still going up: NoPower / NoWater / NoSewage
+ }
+ 
+ local _started = false
+@@ -60,6 +77,13 @@
+ local _folderConns: { RBXScriptConnection } = {}
+ local _watched: { [Instance]: boolean } = {}
+ 
++local function stateDef(state: string): any
++	for _, s in STATES do
++		if s.attr == state then return s end
++	end
++	return nil
++end
++
+ local function topOf(model: Model): number
+ 	local ok, _, size = pcall(function()
+ 		local cf, s = model:GetBoundingBox()
+@@ -74,10 +98,7 @@
+ end
+ 
+ local function show(model: Model, state: string)
+-	local def: any = nil
+-	for _, s in STATES do
+-		if s.attr == state then def = s break end
+-	end
++	local def = stateDef(state)
+ 	if not def then return end
+ 	local existing = _badges[model]
+ 	if existing then
+@@ -139,6 +160,222 @@
+ 	hide(model)
+ end
+ 
++-- ---- clustering ------------------------------------------------------------------------
++type ClusterSlot = { part: Part, gui: BillboardGui, disc: Frame, glyph: TextLabel, count: TextLabel }
++local _clusterFolder: Folder? = nil
++local _clusterPool: { ClusterSlot } = {}
++local _clusterConn: RBXScriptConnection? = nil
++local _hidden: { [BillboardGui]: boolean } = {} -- badges folded into a cluster right now
++
++local function clusterFolder(): Folder
++	local f = _clusterFolder
++	if f and f.Parent then return f end
++	local made = Instance.new("Folder")
++	made.Name = "UtilityBadgeClusters"
++	made.Parent = Workspace.CurrentCamera or Workspace
++	_clusterFolder = made
++	table.clear(_clusterPool)
++	return made
++end
++
++local function clusterSlot(i: number): ClusterSlot
++	local slot = _clusterPool[i]
++	if slot and slot.part.Parent then return slot end
++	-- An invisible anchor per cluster, local to this client (it lives under the camera).
++	local part = Instance.new("Part")
++	part.Name = "ClusterAnchor"
++	part.Anchored = true
++	part.CanCollide = false
++	part.CanQuery = false
++	part.CanTouch = false
++	part.CastShadow = false
++	part.Transparency = 1
++	part.Size = Vector3.new(0.2, 0.2, 0.2)
++	part.Parent = clusterFolder()
++
++	local gui = Instance.new("BillboardGui")
++	gui.Name = "UtilityCluster"
++	gui.Adornee = part
++	gui.AlwaysOnTop = true
++	gui.Size = UDim2.fromOffset(CLUSTER_BADGE, CLUSTER_BADGE)
++	gui.MaxDistance = CLUSTER_MAX_DISTANCE
++	gui.ResetOnSpawn = false
++	gui.Enabled = false
++
++	local disc = Instance.new("Frame")
++	disc.Size = UDim2.fromScale(1, 1)
++	disc.BorderSizePixel = 0
++	disc.Parent = gui
++	local round = Instance.new("UICorner")
++	round.CornerRadius = UDim.new(1, 0)
++	round.Parent = disc
++	local edge = Instance.new("UIStroke")
++	edge.Color = Color3.fromRGB(24, 24, 26)
++	edge.Thickness = 2
++	edge.Transparency = 0.15
++	edge.Parent = disc
++
++	local glyph = Instance.new("TextLabel")
++	glyph.BackgroundTransparency = 1
++	glyph.Size = UDim2.fromScale(0.8, 0.8)
++	glyph.Position = UDim2.fromScale(0.1, 0.1)
++	glyph.TextColor3 = Color3.fromRGB(255, 250, 240)
++	glyph.TextScaled = true
++	glyph.FontFace = Theme.Font.Bold
++	glyph.Parent = disc
++
++	-- The count, on a dark pill at the badge's lower right.
++	local count = Instance.new("TextLabel")
++	count.AnchorPoint = Vector2.new(0.5, 0.5)
++	count.Position = UDim2.fromScale(0.92, 0.9)
++	count.Size = UDim2.fromOffset(24, 15)
++	count.BackgroundColor3 = Color3.fromRGB(24, 24, 26)
++	count.BackgroundTransparency = 0.05
++	count.BorderSizePixel = 0
++	count.TextColor3 = Color3.fromRGB(255, 250, 240)
++	count.TextScaled = true
++	count.FontFace = Theme.Font.Bold
++	count.Parent = disc
++	local pill = Instance.new("UICorner")
++	pill.CornerRadius = UDim.new(1, 0)
++	pill.Parent = count
++
++	gui.Parent = part
++	local made: ClusterSlot = { part = part, gui = gui, disc = disc, glyph = glyph, count = count }
++	_clusterPool[i] = made
++	return made
++end
++
++local function reveal(gui: BillboardGui)
++	if _hidden[gui] then
++		_hidden[gui] = nil
++		if gui.Parent then gui.Enabled = true end
++	end
++end
++
++type Item = { gui: BillboardGui, pos: Vector3, x: number, y: number }
++
++local function recluster()
++	local cam = Workspace.CurrentCamera
++	if not cam then return end
++	local camPos = cam.CFrame.Position
++	-- Candidates per badge kind; everything else stands alone.
++	local byState: { [string]: { Item } } = {}
++	for _, gui in _badges do
++		local anchor = gui.Adornee
++		local state = gui:GetAttribute("State")
++		if not (anchor and anchor:IsA("BasePart") and anchor.Parent and typeof(state) == "string") then
++			reveal(gui)
++			continue
++		end
++		local pos = (anchor :: BasePart).Position + gui.StudsOffsetWorldSpace
++		local dist = (pos - camPos).Magnitude
++		local sp, onScreen = cam:WorldToViewportPoint(pos)
++		if not onScreen or dist < CLUSTER_MIN_DIST or dist > CLUSTER_MAX_DISTANCE then
++			reveal(gui)
++			continue
++		end
++		local list = byState[state]
++		if not list then
++			list = {}
++			byState[state] = list
++		end
++		table.insert(list, { gui = gui, pos = pos, x = sp.X, y = sp.Y })
++	end
++
++	local used = 0
++	local stillHidden: { [BillboardGui]: boolean } = {}
++	for _, def in STATES do
++		local list = byState[def.attr]
++		if not list then continue end
++		-- Greedy: the next unclaimed badge gathers every unclaimed one within CLUSTER_PX of
++		-- it. A screen-space hash keeps that local. Sorted so the result is stable frame to
++		-- frame while the camera holds still.
++		table.sort(list, function(a, b) return a.x < b.x or (a.x == b.x and a.y < b.y) end)
++		local grid: { [number]: { number } } = {}
++		for i, it in list do
++			local k = math.floor(it.x / CLUSTER_PX) * 100003 + math.floor(it.y / CLUSTER_PX)
++			local cell = grid[k]
++			if not cell then
++				cell = {}
++				grid[k] = cell
++			end
++			table.insert(cell, i)
++		end
++		local taken: { [number]: boolean } = {}
++		for i, seed in list do
++			if taken[i] then continue end
++			taken[i] = true
++			local members = { seed }
++			local cx, cy = math.floor(seed.x / CLUSTER_PX), math.floor(seed.y / CLUSTER_PX)
++			for gx = cx - 1, cx + 1 do
++				for gy = cy - 1, cy + 1 do
++					for _, j in (grid[gx * 100003 + gy] or {}) do
++						if not taken[j] then
++							local o = list[j]
++							local dx, dy = o.x - seed.x, o.y - seed.y
++							if dx * dx + dy * dy <= CLUSTER_PX * CLUSTER_PX then
++								taken[j] = true
++								table.insert(members, o)
++							end
++						end
++					end
++				end
++			end
++			if #members < 2 then
++				reveal(seed.gui)
++				continue
++			end
++			local sum = Vector3.zero
++			for _, m in members do
++				sum += m.pos
++				stillHidden[m.gui] = true
++				_hidden[m.gui] = true
++				m.gui.Enabled = false
++			end
++			used += 1
++			local slot = clusterSlot(used)
++			slot.part.CFrame = CFrame.new(sum / #members)
++			slot.disc.BackgroundColor3 = def.color or Theme.Color.Danger
++			slot.glyph.Text = def.glyph
++			slot.count.Text = if #members > 99 then "99+" else tostring(#members)
++			slot.gui.Enabled = true
++		end
++	end
++	-- Badges that were folded last pass but are not now come back on their own.
++	for gui in _hidden do
++		if not stillHidden[gui] then reveal(gui) end
++	end
++	for i = used + 1, #_clusterPool do
++		_clusterPool[i].gui.Enabled = false
++	end
++end
++
++local function startClustering()
++	if _clusterConn then return end
++	local acc = 0
++	_clusterConn = RunService.Heartbeat:Connect(function(dt: number)
++		acc += dt
++		if acc < CLUSTER_EVERY then return end
++		acc = 0
++		recluster()
++	end)
++end
++
++local function stopClustering()
++	if _clusterConn then
++		_clusterConn:Disconnect()
++		_clusterConn = nil
++	end
++	for gui in _hidden do
++		if gui.Parent then gui.Enabled = true end
++	end
++	table.clear(_hidden)
++	if _clusterFolder then _clusterFolder:Destroy() end
++	_clusterFolder = nil
++	table.clear(_clusterPool)
++end
++
+ local function untrack(model: Model)
+ 	local conns = _conns[model]
+ 	if conns then
+@@ -176,6 +413,7 @@
+ function NoPowerView.Start()
+ 	if _started then return end
+ 	_started = true
++	startClustering()
+ 
+ 	-- These folders only exist once a city is loaded, and they are destroyed and rebuilt on
+ 	-- every load, so this matches by NAME anywhere under _City and re-attaches rather than
+@@ -196,6 +434,7 @@
+ end
+ 
+ function NoPowerView.Stop()
++	stopClustering()
+ 	for _, c in _folderConns do c:Disconnect() end
+ 	table.clear(_folderConns)
+ 	table.clear(_watched)

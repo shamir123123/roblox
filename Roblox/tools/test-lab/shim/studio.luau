@@ -532,6 +532,22 @@ function methods.GetService(_, name)
 	if not s then s = service(name) end
 	return s
 end
+-- TweenService stand-in: a tween lands on its goal the moment it is played (no animation).
+function methods.Create(self, target, _info, goal)
+	if self._class ~= "TweenService" and self._name ~= "TweenService" then error("Create is TweenService-only") end
+	local completed = Signal.new()
+	local tw = { Completed = completed, PlaybackState = "Begin" }
+	function tw.Play()
+		for k, v in goal or {} do target[k] = v end
+		tw.PlaybackState = "Completed"
+		task.defer(function() completed:Fire("Completed") end)
+	end
+	function tw.Cancel() end
+	function tw.Pause() end
+	function tw.Destroy() end
+	tw.play = tw.Play
+	return setmetatable(tw, { __index = function(_, k) error("tween: no member " .. tostring(k)) end })
+end
 methods.FindService = methods.GetService
 game._props.PlaceId = 0
 game._props.GameId = 0
@@ -590,6 +606,10 @@ local envBase = {
 	NumberSequenceKeypoint = roblox.NumberSequenceKeypoint, ColorSequenceKeypoint = roblox.ColorSequenceKeypoint,
 	Vector3int16 = roblox.Vector3int16, PhysicalProperties = roblox.PhysicalProperties,
 	Instance = Instance, Random = Random, RaycastParams = RaycastParams, OverlapParams = OverlapParams,
+	TweenInfo = { new = function(time, style, dir, repeats, reverses, delayTime)
+		return { Time = time or 1, EasingStyle = style, EasingDirection = dir, RepeatCount = repeats or 0,
+			Reverses = reverses or false, DelayTime = delayTime or 0 }
+	end },
 	task = task, os = fakeOs, typeof = typeof_,
 	tick = function() return clock.now end, time = function() return clock.now end,
 	wait = task.wait, delay = task.delay, spawn = task.spawn,
