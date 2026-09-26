@@ -1,0 +1,730 @@
+--- a/CitySimConstants
++++ b/CitySimConstants
+@@ -17,6 +17,15 @@
+ -- Tick --------------------------------------------------------------------
+ CitySimConstants.SIM_TICK = 1.0
+ 
++-- Calendar ----------------------------------------------------------------
++-- One game day = DAY_SECONDS real seconds at GameSpeed 1 (1 tick = 1 s at 1x). A 30-day
++-- month is 12 real hours at 1x, 6 at 2x, 4 at 3x. Every per-tick money figure below is
++-- derived from a per-month one, so changing the day length never changes what a month
++-- earns or costs -- only how long a month takes.
++CitySimConstants.DAY_SECONDS    = 1440
++CitySimConstants.DAYS_PER_MONTH = 30
++CitySimConstants.MONTH_TICKS    = CitySimConstants.DAY_SECONDS * CitySimConstants.DAYS_PER_MONTH
++
+ -- Industrial pollution / noise sources, indexed by building level ----------
+ CitySimConstants.INDUSTRIAL_POLLUTION        = table.freeze({ 0.5, 0.75, 1.0 })
+ CitySimConstants.INDUSTRIAL_POLLUTION_RADIUS = 44 * WS
+@@ -99,13 +108,12 @@
+ CitySimConstants.COMM_INPUT_PER      = 1.0   -- goods/tick needed per filled commercial capacity
+ CitySimConstants.IMPORT_UNIT_COST    = 7.0   -- money/tick per imported good (the penalty)
+ CitySimConstants.LOCAL_GOODS_MARGIN  = 2.5   -- money/tick per locally-supplied good (the reward)
+--- NOTE: these are per-TICK (1 tick = 1s at 1x). The HUD/dashboard project them to a
+--- month (x MONTHLY_TICKS = 54000), so a value of 0.01/resident already reads as ~540
+--- per resident per month. They were ~50x too high (a 160-pop town earned millions a
+--- month); rebalanced so a small city runs on a tight, manageable budget. TUNE HERE.
+-CitySimConstants.RES_TAX             = 0.010  -- per resident, at the default tax rate
+-CitySimConstants.COMM_TAX            = 0.020  -- per filled commercial capacity, at the default rate
+-CitySimConstants.IND_TAX             = 0.014  -- per filled industrial capacity, at the default rate
++-- NOTE: tuned PER MONTH, applied per TICK (1 tick = 1s at 1x): 540 per resident per month
++-- is 540 / MONTH_TICKS a tick. They were ~50x too high once (a 160-pop town earned
++-- millions a month); rebalanced so a small city runs on a tight, manageable budget. TUNE HERE.
++CitySimConstants.RES_TAX             = 540 / CitySimConstants.MONTH_TICKS   -- per resident, at the default tax rate
++CitySimConstants.COMM_TAX            = 1080 / CitySimConstants.MONTH_TICKS  -- per filled commercial capacity, at the default rate
++CitySimConstants.IND_TAX             = 756 / CitySimConstants.MONTH_TICKS   -- per filled industrial capacity, at the default rate
+ 
+ -- Budget: player-adjustable tax rates (percent). The RES/COMM/IND_TAX yields above
+ -- are the take at TAX_DEFAULT_RATE; actual income scales linearly with the chosen
+@@ -120,8 +128,8 @@
+ CitySimConstants.TAX_DEMAND_PER_PCT    = 0.010  -- demand lost per % above comfort (per zone)
+ CitySimConstants.TAX_LOW_BONUS_MAX     = 0.05   -- cap on happiness/demand gained from taxes below default
+ 
+--- Upkeep: running costs, expressed per in-game MONTH (MONTHLY_TICKS in
+--- CityEconomyService) and drained per tick. Roads cost by the metre; service
++-- Upkeep: running costs, expressed per in-game MONTH (MONTH_TICKS above) and drained
++-- per tick. Roads cost by the metre; service
+ -- buildings (emergency + schools) cost a fraction of their build price each month.
+ CitySimConstants.UPKEEP_ROAD_PER_METER   = 6.0   -- per metre of road, per month
+ CitySimConstants.UPKEEP_SERVICE_FRACTION = 0.60  -- service monthly upkeep = 60% of build cost (x funding)
+@@ -154,14 +162,28 @@
+ CitySimConstants.LOAN_ANNUAL_RATE   = 0.08   -- 8% per year
+ CitySimConstants.LOAN_STEP          = 25000  -- borrow/repay increment used by the UI
+ 
+--- Visible supply chain (SupplyService): industry produces goods into a warehouse,
+--- delivery trucks carry them to commercial shelves, citizens buy off the shelf,
+--- and industrial surplus nobody needs is sold direct for export income.
+-CitySimConstants.SUPPLY_PRODUCE_PER_LEVEL   = 5     -- goods/tick produced per industrial building level
+-CitySimConstants.SUPPLY_WAREHOUSE_CAP_LEVEL = 60    -- warehouse cap per industrial level
+-CitySimConstants.SUPPLY_SHELF_CAP_LEVEL     = 12    -- shop shelf cap per commercial level (lower = easier to keep full)
+-CitySimConstants.SUPPLY_RESTOCK_FRAC        = 0.7   -- send a truck when a shop's shelf drops below this fraction of cap
+-CitySimConstants.SUPPLY_TRUCK_CAPACITY      = 24    -- goods carried per delivery truck
++-- Visible supply chain (SupplyService). One good, STOCK: every industrial building makes
++-- it, every commercial building sells it, and any plant can supply any shop. One unit is
++-- one household shopping trip's worth. Grounded in real retail replenishment:
++--   * a shop reorders on an order-point / order-up-to rule: when stock on hand plus stock
++--     already on its way falls to REORDER_DAYS of its own recent sales, it orders back up
++--     to TARGET_DAYS. With these numbers a shop takes ~2 deliveries a week, the rhythm of
++--     a small store (big stores get the same rhythm in bigger trucks).
++--   * a plant holds about two weeks of its own output (make-to-stock plants target a few
++--     weeks of finished goods); surplus past a few days' reserve leaves as export.
++--   * truck sizes follow real pallet counts: van 4, box trucks 8 and 12, a 53 ft semi 26
++--     (10 units to the pallet).
++CitySimConstants.SUPPLY_STOCK_NAME          = "Stock"
++CitySimConstants.SUPPLY_PRODUCE_PER_DAY     = table.freeze({ 30, 80, 200 }) -- units a plant makes per game day, by level
++CitySimConstants.SUPPLY_YARD_DAYS           = 14    -- a plant's yard holds this many days of its own output
++CitySimConstants.SUPPLY_EXPORT_RESERVE_DAYS = 3     -- days of output a plant keeps back for the city's own shops
++CitySimConstants.SUPPLY_SHOP_CAP            = table.freeze({ 40, 100, 260 }) -- units a shop can hold, by level
++CitySimConstants.SUPPLY_SHOP_DEMAND_PRIOR   = table.freeze({ 5, 12, 30 })    -- units/day a new shop expects, by level, until it has sales of its own
++CitySimConstants.SUPPLY_TARGET_DAYS         = 6     -- order-up-to level, in days of the shop's own sales
++CitySimConstants.SUPPLY_REORDER_DAYS        = 2.5   -- order point: ~1 day of delivery lead time + 1.5 days of safety stock
++CitySimConstants.SUPPLY_MIN_ORDER           = 10    -- nobody sends a truck for less than a pallet
++CitySimConstants.SUPPLY_DEMAND_SMOOTHING    = 0.3   -- how much one day's sales move a shop's forecast
++CitySimConstants.SUPPLY_TRUCK_TIER_CAPACITY = table.freeze({ 40, 80, 120, 260 }) -- units per truck tier: van, small box, box, semi
+ CitySimConstants.SUPPLY_MAX_TRUCKS          = 20    -- floor on concurrent LOADED deliveries (a truck running home empty holds no slot)
+ CitySimConstants.SUPPLY_MAX_TRUCKS_CEILING  = 60    -- ...and the ceiling. The live cap tracks how many shops are waiting, so a distant
+                                                     -- industrial district (minutes per round trip) cannot starve the city out of a flat 20.
+@@ -171,13 +193,17 @@
+ CitySimConstants.SUPPLY_TRUCK_TIER_LOTS     = table.freeze({ 6, 12, 20 })
+ CitySimConstants.SUPPLY_TRUCK_SPEED         = 32 * WS -- studs/sec; same blocks-per-second at any world scale
+ CitySimConstants.SUPPLY_TICK                = 1.0   -- production/dispatch pass seconds (GameSpeed-scaled)
+-CitySimConstants.SUPPLY_DIRECT_SALE_PRICE   = 0.03  -- treasury per good sold direct (export; below retail)
+-CitySimConstants.SUPPLY_DIRECT_SALE_CHUNK   = 6     -- goods an industry sells direct per tick when unneeded
+-CitySimConstants.SUPPLY_SHOP_BASKET         = 2     -- goods a shopping trip tries to buy
+-CitySimConstants.SUPPLY_SHOP_PRICE          = 0.06  -- treasury per good bought at a shop (retail)
+--- Product types shown on the building info panel. Each building gets a stable one
+--- (picked deterministically from its blueprint id) -- flavour only for v1.
+-CitySimConstants.SUPPLY_INDUSTRIAL_PRODUCTS = table.freeze({ "Lumber", "Steel", "Plastics", "Textiles", "Machinery", "Glass", "Chemicals", "Processed Food" })
+-CitySimConstants.SUPPLY_COMMERCIAL_PRODUCTS = table.freeze({ "Groceries", "Clothing", "Electronics", "Furniture", "Hardware", "Books", "Appliances", "Toys" })
++CitySimConstants.SUPPLY_DIRECT_SALE_PRICE   = 2.5   -- treasury per unit sold out of the city (export; below retail)
++CitySimConstants.SUPPLY_SHOP_BASKET         = 1     -- units a shopping trip buys (one unit IS one trip's worth)
++CitySimConstants.SUPPLY_SHOP_PRICE          = 5     -- treasury per unit bought at a shop (retail)
++-- Real households shop a few times a week, not whenever they are idle. Each household
++-- makes SHOP_TRIPS_PER_WEEK trips on average, during shop hours.
++CitySimConstants.SHOP_TRIPS_PER_WEEK        = 2.5
++CitySimConstants.SHOP_OPEN_HOUR             = 8
++CitySimConstants.SHOP_CLOSE_HOUR            = 20
++-- The tax panel still groups commercial / industrial income by what a building deals in;
++-- there is one good, so one group each.
++CitySimConstants.SUPPLY_INDUSTRIAL_PRODUCTS = table.freeze({ CitySimConstants.SUPPLY_STOCK_NAME })
++CitySimConstants.SUPPLY_COMMERCIAL_PRODUCTS = table.freeze({ CitySimConstants.SUPPLY_STOCK_NAME })
+ 
+ return table.freeze(CitySimConstants)
+--- a/TimeService
++++ b/TimeService
+@@ -11,9 +11,11 @@
+ local Players           = game:GetService("Players")
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+ 
++local Const = require(script.Parent.CitySimConstants)
++
+ local TimeService = {}
+ 
+-local DAY_SECONDS = 1800 -- 30 real minutes per full day/night cycle at GameSpeed 1
++local DAY_SECONDS = Const.DAY_SECONDS -- real seconds per full day/night cycle at GameSpeed 1 (24 min: a month is 12 h)
+ 
+ -- Night (18:00-06:00) is squeezed into NIGHT_SHARE of the cycle so days feel long and
+ -- nights pass quickly. frac 0 = midnight (night midpoint), 0.5 = noon. The life-sim
+--- a/CityEconomyService
++++ b/CityEconomyService
+@@ -48,10 +48,9 @@
+ end
+ 
+ -- The treasury changes by `net` every tick (1 tick = 1s at 1x). The HUD shows a
+--- steady MONTHLY rate instead of this per-second figure: 1 in-game day = 1800
+--- ticks (DAY_SECONDS in TimeService), and a month is 30 days -> 54000 ticks.
+--- Tune here if a month should be longer/shorter.
+-local MONTHLY_TICKS = 1800 * 30
++-- steady MONTHLY rate instead of this per-second figure. The calendar lives in
++-- CitySimConstants (DAY_SECONDS x DAYS_PER_MONTH), shared with TimeService.
++local MONTHLY_TICKS = Const.MONTH_TICKS
+ 
+ local _buildingService: any
+ local _cityStatsService: any
+--- a/SupplyService
++++ b/SupplyService
+@@ -1,11 +1,10 @@
+ --!strict
+ -- SupplyService
+--- The visible goods supply chain. Each industrial building produces goods into a
+--- private warehouse; delivery trucks drive that stock to commercial buildings
+--- whose shelves are running low; citizens buy goods off those shelves when they
+--- shop (CitizenService). Industrial stock that no shop needs is sold directly for
+--- export income -- "if commercial doesn't need it, industry sells it" -- and the
+--- realised export income is handed to CityEconomyService each tick.
++-- The visible supply chain. Each industrial building makes stock into its own yard;
++-- delivery trucks drive it to commercial buildings that have reached their order point;
++-- citizens buy it off those shelves when they shop (CitizenService). Stock a plant holds
++-- beyond the city's needs leaves as export -- "if commercial doesn't need it, industry
++-- sells it" -- and the realised export income is handed to CityEconomyService each tick.
+ --
+ -- Trade with the outside world is carried by trucks too, through the map-edge road links
+ -- (OutsideConnectionService): an IMPORT truck drives in from the nearest connection to a
+@@ -13,12 +12,12 @@
+ -- and drives it out of the map; the sale is paid when it leaves. No road to the edge, no
+ -- trade -- shelves run dry and warehouses fill, and the player sees why.
+ --
+--- Owns exactly one domain: per-building goods stock + the delivery fleet. It reads
+--- building views from BuildingService and routes trucks on RoadService's nav graph
+--- (the same PathFollower the citizen cars use). Stock is derived runtime state and
+--- is never persisted -- it rebuilds from production within a few ticks.
++-- Owns exactly one domain: per-building stock + the delivery fleet. It reads building
++-- views from BuildingService and routes trucks on RoadService's nav graph (the same
++-- PathFollower the citizen cars use). There is one good, STOCK: plants make it by the game
++-- day, shops sell it and reorder it on their own sales forecast (order point / order-up-to).
+ --
+--- The TRUCKS are persisted (see serialize/restore at the end). A delivery in flight is a
++-- Stock and TRUCKS are persisted (see serialize/restore). A delivery in flight is a
+ -- vehicle standing in traffic like any other, and dropping it on load also leaks the
+ -- _inbound reservation that stops a second truck being sent for the same delivery.
+ 
+@@ -36,11 +35,22 @@
+ local SupplyService = {}
+ 
+ -- == Tuning (from constants) ===================================================
+-local PRODUCE_PER_LEVEL   = Const.SUPPLY_PRODUCE_PER_LEVEL
+-local WAREHOUSE_CAP_LEVEL = Const.SUPPLY_WAREHOUSE_CAP_LEVEL
+-local SHELF_CAP_LEVEL     = Const.SUPPLY_SHELF_CAP_LEVEL
+-local RESTOCK_FRAC        = Const.SUPPLY_RESTOCK_FRAC
+-local TRUCK_CAPACITY      = Const.SUPPLY_TRUCK_CAPACITY
++-- One good (STOCK_NAME), counted in units of one shopping trip. Plants make it by the
++-- game DAY, shops reorder on their own sales forecast (see CitySimConstants for where the
++-- numbers come from).
++local DAY_SECONDS         = Const.DAY_SECONDS
++local STOCK_NAME          = Const.SUPPLY_STOCK_NAME
++local PRODUCE_PER_DAY     = Const.SUPPLY_PRODUCE_PER_DAY
++local YARD_DAYS           = Const.SUPPLY_YARD_DAYS
++local EXPORT_RESERVE_DAYS = Const.SUPPLY_EXPORT_RESERVE_DAYS
++local SHOP_CAP            = Const.SUPPLY_SHOP_CAP
++local SHOP_DEMAND_PRIOR   = Const.SUPPLY_SHOP_DEMAND_PRIOR
++local TARGET_DAYS         = Const.SUPPLY_TARGET_DAYS
++local REORDER_DAYS        = Const.SUPPLY_REORDER_DAYS
++local MIN_ORDER           = Const.SUPPLY_MIN_ORDER
++local DEMAND_SMOOTHING    = Const.SUPPLY_DEMAND_SMOOTHING
++local TIER_CAPACITY       = Const.SUPPLY_TRUCK_TIER_CAPACITY
++local TRUCK_CAPACITY      = TIER_CAPACITY[#TIER_CAPACITY] -- the biggest load anything carries
+ local MAX_TRUCKS          = Const.SUPPLY_MAX_TRUCKS
+ local MAX_TRUCKS_CEILING  = Const.SUPPLY_MAX_TRUCKS_CEILING
+ local TIER_LOTS           = Const.SUPPLY_TRUCK_TIER_LOTS
+@@ -56,13 +66,11 @@
+ -- the old 0.6 floated the truck through the yard and dropped it on hand-off.
+ local TRUCK_HEIGHT        = VehicleFactory.RIDE_CLEARANCE
+ local TRUCK_FALLBACK      = "LowPolyVan" -- used only if the catalog fleet was never built
+-local IND_PRODUCTS       = Const.SUPPLY_INDUSTRIAL_PRODUCTS
+-local COMM_PRODUCTS      = Const.SUPPLY_COMMERCIAL_PRODUCTS
+ -- Unloading is the part of a delivery you can actually watch, so it takes time and the
+--- time scales with the load: the shelf fills when the last crate is off the truck, not the
++-- time scales with the load: the shelf fills when the last pallet is off the truck, not the
+ -- instant the bumper reaches the kerb.
+ local UNLOAD_BASE        = 2.5  -- game-seconds standing at the kerb per delivery
+-local UNLOAD_PER_GOOD    = 0.18 -- ...plus this per crate (a full 24-crate load ~= 6.8s)
++local UNLOAD_PER_UNIT    = 0.05 -- ...plus this per unit (a van ~4.5s, a full semi ~15.5s)
+ 
+ -- == Dependencies / state ======================================================
+ local _buildingService: any
+@@ -73,9 +81,12 @@
+ local _heartbeat: RBXScriptConnection?
+ local _running = false
+ 
+-local _warehouse: { [string]: number } = {}   -- industrial bpId -> goods ready to ship
+-local _shelf: { [string]: number } = {}        -- commercial bpId -> goods for sale
+-local _inbound: { [string]: number } = {}      -- commercial bpId -> goods already en route
++local _warehouse: { [string]: number } = {}   -- industrial bpId -> units ready to ship
++local _shelf: { [string]: number } = {}        -- commercial bpId -> units for sale
++local _inbound: { [string]: number } = {}      -- commercial bpId -> units already en route
++local _demand: { [string]: number } = {}       -- commercial bpId -> forecast units wanted per game day
++local _wantedToday: { [string]: number } = {}  -- commercial bpId -> units shoppers asked for today, sold or not
++local _dayAccum = 0                             -- game-seconds into the current forecasting day
+ local _directSaleRevenue = 0                    -- accrued export income, drained by the economy
+ 
+ -- cached supply-health stats for the HUD economy feed
+@@ -124,17 +135,42 @@
+ 	return math.clamp(b.level or 1, 1, 3)
+ end
+ 
+--- A stable product type for a building, picked deterministically from its id.
+-local function productFor(bpId: string, list: { string }): string
+-	local sum = 0
+-	for i = 1, #bpId do sum += string.byte(bpId, i) end
+-	return list[(sum % #list) + 1]
++-- Public: what a commercial/industrial building deals in (for per-product tax). One good.
++function SupplyService.productOf(_bpId: string, _zone: string): string
++	return STOCK_NAME
+ end
+ 
+--- Public: the product type a commercial/industrial building deals in (for per-product tax).
+-function SupplyService.productOf(bpId: string, zone: string): string
+-	local list = if zone == "Industrial" then IND_PRODUCTS else COMM_PRODUCTS
+-	return productFor(bpId, list)
++local function plantOutputPerDay(b: any): number
++	return PRODUCE_PER_DAY[lvl(b)] or PRODUCE_PER_DAY[1]
++end
++
++local function plantYardCap(b: any): number
++	return plantOutputPerDay(b) * YARD_DAYS
++end
++
++local function shopCap(b: any): number
++	return SHOP_CAP[lvl(b)] or SHOP_CAP[1]
++end
++
++-- Units a shop expects to sell per game day: its own smoothed sales once it has some,
++-- the level's prior until then.
++local function shopDemand(b: any): number
++	local d = _demand[b.bpId]
++	if not d then
++		d = SHOP_DEMAND_PRIOR[lvl(b)] or SHOP_DEMAND_PRIOR[1]
++		_demand[b.bpId] = d
++	end
++	return d
++end
++
++-- A day has passed: fold what each shop's customers asked for into its forecast. Asked
++-- for, not sold -- a shop that ran dry still had the customers, and ordering on its
++-- empty-shelf sales would starve it for good.
++local function rollDemand()
++	for id, d in _demand do
++		_demand[id] = d + ((_wantedToday[id] or 0) - d) * DEMAND_SMOOTHING
++	end
++	table.clear(_wantedToday)
+ end
+ 
+ -- == The delivery fleet ========================================================
+@@ -159,11 +195,11 @@
+ 
+ local MAX_TIER = #TIER_LOTS + 1
+ 
++-- The smallest truck the load fits in.
+ local function tierForLoad(load: number): number
+-	local frac = math.clamp(load / TRUCK_CAPACITY, 0, 1)
+-	if frac <= 0.25 then return 1 end
+-	if frac <= 0.55 then return 2 end
+-	if frac <= 0.85 then return 3 end
++	for tier = 1, MAX_TIER do
++		if load <= (TIER_CAPACITY[tier] or TRUCK_CAPACITY) then return tier end
++	end
+ 	return MAX_TIER
+ end
+ 
+@@ -213,8 +249,13 @@
+ 	return TRUCK_FALLBACK
+ end
+ 
++-- The most one run from this plant can carry: the biggest truck its yard can turn.
++local function depotLoadCap(fromId: string): number
++	return TIER_CAPACITY[tierForFootprint(_footprint[fromId])] or TRUCK_CAPACITY
++end
++
+ local function unloadSeconds(load: number): number
+-	return UNLOAD_BASE + UNLOAD_PER_GOOD * math.max(0, load)
++	return UNLOAD_BASE + UNLOAD_PER_UNIT * math.max(0, load)
+ end
+ 
+ local function ensureFolder(): Folder
+@@ -233,12 +274,15 @@
+ 	return _shelf[bpId] or 0
+ end
+ 
+--- Buy up to `want` goods off a shop's shelf. Returns the amount actually sold
++-- Buy up to `want` units off a shop's shelf. Returns the amount actually sold
+ -- (0 if the shelf is empty -- the supply-chain penalty for an understocked shop).
++-- Every request counts toward the shop's sales forecast, served or not.
+ function SupplyService.consumeStock(bpId: string, want: number): number
++	if want <= 0 then return 0 end
++	_wantedToday[bpId] = (_wantedToday[bpId] or 0) + want
+ 	local have = _shelf[bpId] or 0
+-	if have <= 0 or want <= 0 then return 0 end
+-	local sold = math.min(have, want)
++	if have <= 0 then return 0 end
++	local sold = math.min(math.floor(have), want)
+ 	_shelf[bpId] = have - sold
+ 	return sold
+ end
+@@ -602,13 +646,15 @@
+ end
+ 
+ -- == Persistence ==============================================================
+--- Only the fleet, never the stock. A saved truck is {pose, from, to, load}: the load has
+--- ALREADY left its warehouse (dispatch deducted it), so restore re-establishes the
+--- inbound reservation and re-drives the run rather than deducting anything a second time.
++-- The fleet and the stock. A saved truck is {pose, from, to, load}: the load has ALREADY
++-- left its warehouse (dispatch deducted it), so restore re-establishes the inbound
++-- reservation and re-drives the run rather than deducting anything a second time. Stock
++-- (v2) is saved because it is days of production and sales, not something a few ticks
++-- rebuild: dropping it emptied every shop at once and sent a truck to each on load.
+ --
+ -- Buildings are referenced by saveKey, not bpId -- bpIds regenerate on load, saveKeys are
+ -- the stable cross-save handle (the same one CitizenService links homes and jobs by).
+-local SAVE_VERSION = 1
++local SAVE_VERSION = 2
+ 
+ -- 2 decimals, the precision CitizenService and ThroughTrafficService already save a
+ -- vehicle pose at.
+@@ -649,6 +695,9 @@
+ 	table.clear(_warehouse)
+ 	table.clear(_shelf)
+ 	table.clear(_inbound)
++	table.clear(_demand)
++	table.clear(_wantedToday)
++	_dayAccum = 0
+ 	_directSaleRevenue = 0
+ 	_produceAccum = 0
+ 	_statOutput, _statNeed, _statSupplyRatio = 0, 0, 1
+@@ -800,8 +849,40 @@
+ 			end
+ 		end
+ 	end
+-	if #rows == 0 then return nil end
+-	return { version = SAVE_VERSION, keys = keys, trucks = rows }
++	-- Stock rows: {building key, units on hand, units/day forecast (shops only)}.
++	local stock: { any } = {}
++	for id, units in _warehouse do
++		local k = intern(keyById[id])
++		if k and units >= 0.5 then table.insert(stock, { k, r2(units) }) end
++	end
++	for id, daily in _demand do
++		local k = intern(keyById[id])
++		if k then table.insert(stock, { k, r2(_shelf[id] or 0), r2(daily) }) end
++	end
++	if #rows == 0 and #stock == 0 then return nil end
++	return { version = SAVE_VERSION, keys = keys, trucks = rows, stock = stock }
++end
++
++-- Put saved stock back, clamped to what each building can hold now (it may have been
++-- re-levelled or re-zoned). Untrusted: anything not a finite non-negative number is dropped.
++local function restoreStock(rows: any, keys: { any }, bySaveKey: { [string]: any })
++	if typeof(rows) ~= "table" then return end
++	for _, row in rows do
++		if typeof(row) ~= "table" or typeof(row[1]) ~= "number" then continue end
++		local key = keys[row[1]]
++		local b = if typeof(key) == "string" then bySaveKey[key] else nil
++		local units = tonumber(row[2])
++		if not b or not units or units ~= units or units < 0 or units == math.huge then continue end
++		if b.zone == "Industrial" then
++			_warehouse[b.bpId] = math.min(units, plantYardCap(b))
++		elseif b.zone == "Commercial" then
++			_shelf[b.bpId] = math.min(units, shopCap(b))
++			local daily = tonumber(row[3])
++			if daily and daily == daily and daily > 0 and daily < math.huge then
++				_demand[b.bpId] = daily
++			end
++		end
++	end
+ end
+ 
+ -- CitySerializer calls this after buildings and plots are back (the kerbs and saveKeys
+@@ -809,10 +890,10 @@
+ -- taken when CitizenService assigns the rest of the workforce.
+ function SupplyService.restore(blob: any)
+ 	SupplyService.clear()
+-	if typeof(blob) ~= "table" or typeof(blob.trucks) ~= "table" then return end
+-	if tonumber(blob.version) ~= SAVE_VERSION then return end
+-	local g = nav()
+-	if not g or not g:HasEdges() then return end
++	if typeof(blob) ~= "table" then return end
++	-- v1 saved only the fleet; its loads are in the old goods units, close enough to resume.
++	local version = tonumber(blob.version)
++	if version ~= 1 and version ~= SAVE_VERSION then return end
+ 	local keys = if typeof(blob.keys) == "table" then blob.keys else {}
+ 
+ 	local bySaveKey: { [string]: any } = {}
+@@ -822,6 +903,12 @@
+ 		-- saved runs are rebuilt or a reloaded delivery comes back in a different vehicle.
+ 		_footprint[b.bpId] = b.footprint
+ 	end
++	-- Stock first: the trucks below add their loads to the shops' inbound on top of it.
++	restoreStock(blob.stock, keys, bySaveKey)
++
++	if typeof(blob.trucks) ~= "table" then return end
++	local g = nav()
++	if not g or not g:HasEdges() then return end
+ 
+ 	local frameStart = os.clock()
+ 	for _, row in blob.trucks do
+@@ -871,17 +958,17 @@
+ end
+ 
+ -- == Production + dispatch ====================================================
+--- Which depot sends the truck: the NEAREST one holding stock, not a random one. Range is
+--- not banned here -- a lone industrial park on the far side of the map still supplies the
+--- whole city -- it just stops a shop with a plant across the road pulling from one twenty
+--- blocks away and paying the fleet for the whole round trip. Falls back to any stocked
+--- depot when a view has no pivot to measure from.
+-local function nearestSupplier(suppliers: { any }, need: any): any?
++-- Which depot sends the truck: the NEAREST one holding at least `atLeast` units, not a
++-- random one. Range is not banned here -- a lone industrial park on the far side of the
++-- map still supplies the whole city -- it just stops a shop with a plant across the road
++-- pulling from one twenty blocks away and paying the fleet for the whole round trip.
++-- Falls back to any such depot when a view has no pivot to measure from.
++local function nearestSupplier(suppliers: { any }, need: any, atLeast: number): any?
+ 	local to = need.position
+ 	local best: any, fallback: any = nil, nil
+ 	local bestDistSq = math.huge
+ 	for _, cand in suppliers do
+-		if (_warehouse[cand.bpId] or 0) <= 0 then continue end
++		if (_warehouse[cand.bpId] or 0) < atLeast then continue end
+ 		if not fallback then fallback = cand end
+ 		local from = cand.position
+ 		if not (to and from) then continue end
+@@ -895,7 +982,9 @@
+ 	return best or fallback
+ end
+ 
+-local function produceAndDispatch()
++-- One pass: plants make `dt` game-seconds of output, shops at their order point order,
++-- plants with surplus export it.
++local function produceAndDispatch(dt: number)
+ 	local views = _buildingService.listBuildings()
+ 
+ 	-- prune stock for buildings that no longer exist
+@@ -905,75 +994,85 @@
+ 	for id in _shelf do if not alive[id] then _shelf[id] = nil end end
+ 	for id in _inbound do if not alive[id] then _inbound[id] = nil end end
+ 	for id in _footprint do if not alive[id] then _footprint[id] = nil end end
++	for id in _demand do if not alive[id] then _demand[id] = nil end end
++	for id in _wantedToday do if not alive[id] then _wantedToday[id] = nil end end
+ 
++	local dayShare = dt / DAY_SECONDS
+ 	local suppliers: { any } = {}   -- industrial with stock
+-	local needers: { any } = {}     -- commercial below its restock threshold
+-	local totalOutput, totalShelf, totalShelfCap = 0, 0, 0
++	local orders: { { shop: any, qty: number } } = {} -- commercial at its order point
++	local totalOutput, totalDemand, totalShelf, totalTarget = 0, 0, 0, 0
+ 
+ 	for _, b in views do
+ 		if b.abandoned then continue end
+ 		if b.zone == "Industrial" then
+ 			_footprint[b.bpId] = b.footprint
+-			local cap = WAREHOUSE_CAP_LEVEL * lvl(b)
+-			-- A dark plant makes nothing. Its warehouse keeps whatever was already in it and
+-			-- still ships, so the line only goes quiet once the shelves it stocked run out --
+-			-- and then the shops it fed start importing instead (see the top-up below).
+-			local produced = if b.powered == false then 0 else PRODUCE_PER_LEVEL * lvl(b)
+-			totalOutput += produced
+-			_warehouse[b.bpId] = math.min(cap, (_warehouse[b.bpId] or 0) + produced)
+-			if (_warehouse[b.bpId] or 0) > 0 then table.insert(suppliers, b) end
+-			_buildingService.setSupplyInfo(b.bpId, productFor(b.bpId, IND_PRODUCTS), nil, nil)
++			local cap = plantYardCap(b)
++			-- A dark plant makes nothing. Its yard keeps whatever was already in it and still
++			-- ships, so the line only goes quiet once the shelves it stocked run out -- and then
++			-- the shops it fed start importing instead. A full yard stops the line too.
++			local perDay = if b.powered == false then 0 else plantOutputPerDay(b)
++			totalOutput += perDay
++			_warehouse[b.bpId] = math.min(cap, (_warehouse[b.bpId] or 0) + perDay * dayShare)
++			if (_warehouse[b.bpId] or 0) >= 1 then table.insert(suppliers, b) end
++			_buildingService.setSupplyInfo(b.bpId, STOCK_NAME, _warehouse[b.bpId], cap)
+ 		elseif b.zone == "Commercial" then
+-			local cap = SHELF_CAP_LEVEL * lvl(b)
++			-- Order point / order-up-to: when what is on the shelf plus what is already on its
++			-- way falls to REORDER_DAYS of sales, order back up to TARGET_DAYS (never past what
++			-- the shop can hold, never less than a pallet).
++			local cap = shopCap(b)
++			local daily = shopDemand(b)
++			local target = math.min(cap, TARGET_DAYS * daily)
+ 			local onShelf = _shelf[b.bpId] or 0
+-			totalShelf += onShelf
+-			totalShelfCap += cap
+-			_buildingService.setSupplyInfo(b.bpId, productFor(b.bpId, COMM_PRODUCTS), onShelf, cap)
+-			if onShelf + (_inbound[b.bpId] or 0) < cap * RESTOCK_FRAC then
+-				table.insert(needers, b)
++			local position = onShelf + (_inbound[b.bpId] or 0)
++			totalDemand += daily
++			totalShelf += math.min(onShelf, target)
++			totalTarget += target
++			_buildingService.setSupplyInfo(b.bpId, STOCK_NAME, onShelf, cap)
++			if position <= REORDER_DAYS * daily then
++				local qty = math.min(math.ceil(math.max(MIN_ORDER, target - position)), math.floor(cap - position))
++				if qty > 0 then table.insert(orders, { shop = b, qty = qty }) end
+ 			end
+ 		end
+ 	end
+ 
+ 	_statOutput = totalOutput
+-	_statNeed = totalShelfCap
+-	_statSupplyRatio = if totalShelfCap > 0 then math.clamp(totalShelf / totalShelfCap, 0, 1) else 1
++	_statNeed = totalDemand
++	_statSupplyRatio = if totalTarget > 0 then math.clamp(totalShelf / totalTarget, 0, 1) else 1
+ 
+-	-- Match needy shops to suppliers: one truck per shop per pass. The cap tracks how many
+-	-- shops are actually waiting rather than sitting at a flat 20, because a flat 20 IS the
+-	-- range limit: nothing in this service ever measured a distance, but every slot a far
+-	-- depot's round trip held for minutes was a slot no other shop could be restocked from.
+-	local fleetCap = math.clamp(#needers, MAX_TRUCKS, MAX_TRUCKS_CEILING)
+-	for _, need in needers do
+-		local cap = SHELF_CAP_LEVEL * lvl(need)
+-		local deficit = cap - ((_shelf[need.bpId] or 0) + (_inbound[need.bpId] or 0))
+-		if deficit <= 0 then continue end
+-		-- No spare truck is a QUEUE, not a shortage -- the goods exist, they are just waiting
++	-- Fill orders: one truck per shop per pass. The cap tracks how many shops are actually
++	-- waiting rather than sitting at a flat 20, because a flat 20 IS the range limit: every
++	-- slot a far depot's round trip held was a slot no other shop could be restocked from.
++	local fleetCap = math.clamp(#orders, MAX_TRUCKS, MAX_TRUCKS_CEILING)
++	for _, order in orders do
++		local shop = order.shop
++		-- No spare truck is a QUEUE, not a shortage -- the stock exists, it is just waiting
+ 		-- for a lorry, so the shop waits for the next pass rather than importing.
+-		local fleetFree = _busyTrucks < fleetCap
+-		local pick = if fleetFree then nearestSupplier(suppliers, need) else nil
+-		local load = if pick then math.min(TRUCK_CAPACITY, _warehouse[pick.bpId] or 0, deficit) else 0
+-		if pick and load > 0 then
+-			dispatch(pick.bpId, need.bpId, load)
+-		elseif fleetFree then
+-			-- Nothing at home to send: the shop imports, by truck from the nearest outside
++		if _busyTrucks >= fleetCap then break end
++		-- The nearest plant that can fill the whole order; failing that the nearest with a
++		-- pallet or more, sending what it has.
++		local pick = nearestSupplier(suppliers, shop, order.qty) or nearestSupplier(suppliers, shop, MIN_ORDER)
++		if pick then
++			local load = math.min(order.qty, math.floor(_warehouse[pick.bpId] or 0), depotLoadCap(pick.bpId))
++			dispatch(pick.bpId, shop.bpId, load)
++		else
++			-- No plant in the city has it: the shop imports, by truck from the nearest outside
+ 			-- connection. This is what an industrial blackout costs: the shops keep trading,
+ 			-- on someone else's factory, at import prices.
+-			dispatchImport(need.bpId, math.min(TRUCK_CAPACITY, deficit))
++			dispatchImport(shop.bpId, math.min(order.qty, TRUCK_CAPACITY))
+ 		end
+ 	end
+ 
+-	-- Export: a plant with a full warehouse, or one no shop is waiting on, sends a truckload
+-	-- out of the city. Half a load at least -- nobody runs a lorry to the border for a crate.
+-	-- With no road to the edge the warehouse stays full and the plant stops producing.
+-	local nobodyNeeds = (#needers == 0)
++	-- Export: a plant ships what it holds beyond a few days' reserve for the city's shops,
++	-- one FULL truck at a time -- nobody runs a lorry to the border half empty. A full yard
++	-- ships regardless. With no road to the edge the yard fills and the plant stops.
+ 	for _, b in views do
+ 		if b.abandoned or b.zone ~= "Industrial" then continue end
+ 		if _busyTrucks >= fleetCap then break end
+-		local cap = WAREHOUSE_CAP_LEVEL * lvl(b)
+ 		local have = _warehouse[b.bpId] or 0
+-		if (have >= cap or nobodyNeeds) and have >= TRUCK_CAPACITY * 0.5 then
+-			dispatchExport(b.bpId, math.min(have, TRUCK_CAPACITY))
++		local truckLoad = depotLoadCap(b.bpId)
++		local surplus = have - EXPORT_RESERVE_DAYS * plantOutputPerDay(b)
++		if surplus >= truckLoad or (have >= plantYardCap(b) and have >= truckLoad) then
++			dispatchExport(b.bpId, truckLoad)
+ 		end
+ 	end
+ end
+@@ -1007,10 +1106,16 @@
+ 		if sdt <= 0 then return end
+ 		local ok, err = pcall(stepTrucks, sdt)
+ 		if not ok then warn("[SupplyService] truck step failed: " .. tostring(err)) end
++		_dayAccum += sdt
++		if _dayAccum >= DAY_SECONDS then
++			_dayAccum -= DAY_SECONDS
++			rollDemand()
++		end
+ 		_produceAccum += sdt
+ 		if _produceAccum >= PRODUCE_INTERVAL then
++			local passDt = _produceAccum
+ 			_produceAccum = 0
+-			local ok2, err2 = pcall(produceAndDispatch)
++			local ok2, err2 = pcall(produceAndDispatch, passDt)
+ 			if not ok2 then warn("[SupplyService] produce/dispatch failed: " .. tostring(err2)) end
+ 		end
+ 	end)
+--- a/CitizenService
++++ b/CitizenService
+@@ -72,9 +72,6 @@
+ local ROADSIDE_RADIUS   = 700 * WS -- how far a driver looks around the destination for a free bay
+                                    -- (~175 m, a 2-3 minute walk); nearest first, car parks beyond
+ local ERRAND_COOLDOWN   = 15   -- real seconds between a household's errands (apply / shop)
+-local SHOP_CHANCE       = 0.12 -- per idle sim step, chance a household sets out to shop
+-local SHOP_SPEND_MIN    = 8
+-local SHOP_SPEND_RANGE  = 24   -- shopping spend = MIN + rand(0..RANGE) -> store revenue
+ local PRESENCE_RADIUS    = 1400 -- outer bound for people IN FRONT of the camera (the cap binds first)
+ local PRESENCE_CAP       = 140  -- max standing people returned per presence query (perf cap)
+ local PRESENCE_FRONT_COS = 0.17 -- only people within ~80 deg of the camera's look (in front) are rendered
+@@ -146,6 +143,8 @@
+ 	homelessUntil: number?, homelessPos: Vector3?, lastHomePos: Vector3?,
+ 	-- Game-seconds this family's home has gone without power, water or a drain.
+ 	unservedFor: number?,
++	-- Game time (days) of this family's next shopping trip; set on first sight, not saved.
++	nextShopAt: number?,
+ }
+ 
+ local _households: { [number]: Household } = {}
+@@ -170,8 +169,8 @@
+ -- has to know this exists.
+ -- CORRECTNESS CONSTRAINT: a full sweep must finish inside the narrowest commute window, or
+ -- an adult sleeps straight through their shift. That window is SHIFT/SCHOOL_WINDOW_HOURS
+--- wide (1.25h); at TimeService.DAY_SECONDS 1800 that is ~94 real seconds, i.e. ~47 sim
+--- steps at 1x. Keep sweeps well under it -- debugSnapshot reports `sweepSteps` and we warn
++-- wide (1.25h); at Const.DAY_SECONDS 1440 that is 75 game-seconds, i.e. ~37 sim steps
++-- at any speed. Keep sweeps well under it -- debugSnapshot reports `sweepSteps` and we warn
+ -- past SWEEP_WARN, so a city that outgrows the budget shows up instead of going silently
+ -- still.
+ local LOD: any = {
+@@ -2112,6 +2111,10 @@
+ 	local globalToWork = _timeService.isWorkboundWindow()
+ 	local globalToHome = _timeService.isHomeboundWindow()
+ 	local now = os.clock()
++	local hour = _timeService.getDayFraction() * 24
++	local gameNow = day + _timeService.getDayFraction() -- game days, for the shopping schedule
++	local shopGap = 7 / Const.SHOP_TRIPS_PER_WEEK      -- mean game days between a family's shops
++	local shopsOpen = hour >= Const.SHOP_OPEN_HOUR and hour < Const.SHOP_CLOSE_HOUR
+ 
+ 	local cachedJobs: { string }? = nil
+ 	local cachedStores: { string }? = nil
+@@ -2208,13 +2211,17 @@
+ 				end
+ 			end
+ 
+-			-- Shopping: an occasional trip to a commercial store, earning it money. Kept
+-			-- allowed during the work day so idle adults keep commercial traffic alive.
++			-- Shopping: a household shops a few times a week, like a real one
++			-- (Const.SHOP_TRIPS_PER_WEEK), in shop hours, by whichever adult is home when the
++			-- trip is due. First sight spreads the first trip over one gap so a loaded city's
++			-- families do not all set out on the same step.
+ 			if now < a.nextErrandAt then continue end
+-			if _rng:NextNumber() < SHOP_CHANCE then
++			if not h.nextShopAt then h.nextShopAt = gameNow + _rng:NextNumber() * shopGap end
++			if shopsOpen and gameNow >= (h.nextShopAt :: number) then
+ 				cachedStores = cachedStores or stores(views)
+ 				local destId = Trips.pickNear(cachedStores :: { string }, door(h.homeId), Trips.SHOP_BETA)
+ 				if destId then
++					h.nextShopAt = gameNow + shopGap * _rng:NextNumber(0.5, 1.5)
+ 					a.nextErrandAt = now + ERRAND_COOLDOWN
+ 					startErrand(h, a, "shop", destId, 0)
+ 					continue
+@@ -2222,7 +2229,6 @@
+ 			end
+ 
+ 			-- A walk for its own sake, while it is light out.
+-			local hour = _timeService.getDayFraction() * 24
+ 			if hour >= Trips.WALK_FROM_HOUR and hour <= Trips.WALK_TO_HOUR
+ 				and _rng:NextNumber() < Trips.WALK_CHANCE and Trips.walk(h, a) then
+ 				a.nextErrandAt = now + ERRAND_COOLDOWN
+--- a/BuildingInfoController
++++ b/BuildingInfoController
+@@ -1077,21 +1077,18 @@
+ 	_occLabel.Text = if info.kind == "jobs" then "Jobs" else "Residents"
+ 	_occValue.Text = tostring(info.occupants) .. " / " .. tostring(info.capacity)
+ 	_occFill.Size = UDim2.fromScale(if info.capacity > 0 then math.clamp(info.occupants / info.capacity, 0, 1) else 0, 1)
+-	-- Supply chain: what the building sells/produces + remaining shop stock.
++	-- Supply chain: what the building sells/produces + the stock it holds (a shop's shelves,
++	-- a plant's yard).
+ 	local product = model:GetAttribute("Product")
+ 	if typeof(product) == "string" and product ~= "" and (zone == "Commercial" or zone == "Industrial") then
+ 		_sellRow.Visible = true
+ 		_sellLabel.Text = if zone == "Industrial" then "Produces" else "Sells"
+ 		_sellValue.Text = product
+-		if zone == "Commercial" then
+-			local stock = math.floor(tonumber(model:GetAttribute("Stock")) or 0)
+-			local stockCap = math.floor(tonumber(model:GetAttribute("StockCap")) or 0)
+-			_stockRow.Visible = true
+-			_stockLabel.Text = "Stock"
+-			_stockValue.Text = tostring(stock) .. " / " .. tostring(stockCap)
+-		else
+-			_stockRow.Visible = false
+-		end
++		local stock = math.floor(tonumber(model:GetAttribute("Stock")) or 0)
++		local stockCap = math.floor(tonumber(model:GetAttribute("StockCap")) or 0)
++		_stockRow.Visible = true
++		_stockLabel.Text = if zone == "Industrial" then "In yard" else "Stock"
++		_stockValue.Text = tostring(stock) .. " / " .. tostring(stockCap)
+ 	else
+ 		_sellRow.Visible = false
+ 		_stockRow.Visible = false
