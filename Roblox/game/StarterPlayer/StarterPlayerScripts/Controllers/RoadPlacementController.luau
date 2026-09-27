@@ -17,6 +17,7 @@ local SnapUtil        = require(ReplicatedStorage.Road.SnapUtil)
 local PlacementGrid   = require(ReplicatedStorage.Shared.PlacementGrid)
 local Snapper         = require(script.Parent.RoadPlacementSnapper)
 local GhostPreview    = require(script.Parent.RoadGhostPreviewController)
+local Prediction      = require(script.Parent.RoadPlacementPrediction)
 local UndergroundView = require(script.Parent:WaitForChild("UndergroundView"))
 local DeleteHover     = require(script.Parent:WaitForChild("DeleteHoverController"))
 local NotificationController = require(script.Parent.Parent:WaitForChild("HUD"):WaitForChild("NotificationController"))
@@ -94,13 +95,31 @@ local function parallelDisplacement(): number
 end
 
 local _lastSnapResult: any = nil
-local _pendingPlacement: any = nil
--- A fired placement (road or roundabout) waits on PlaceRoadResult to clear the guard
--- above. If that reply never arrives (server errored mid-handler, or the packet was
--- dropped) the guard would wedge the whole road tool. _pendingSince + the watchdog in
--- updateGhost reset it after a generous timeout so the tool self-heals.
-local _pendingSince: number? = nil
+-- Placement is PREDICTED, like movement: a road appears on your screen the moment you click
+-- (RoadPlacementPrediction) and the drawing carries on from its end straight away, instead
+-- of freezing the tool for the round trip to the server. Every request waits here in send
+-- order -- PlaceRoadResult answers in the same order -- until its answer arrives:
+--   accepted -> nothing to do (a roundabout's reset to Idle is applied here)
+--   refused  -> its predicted road is taken away, and the drawing goes back to where it was
+--               before that click, if nothing was drawn after it and it was not cancelled.
+-- If an answer never arrives (server errored mid-handler, packet dropped), the watchdog in
+-- updateGhost forgets every request after a generous timeout so the tool self-heals.
+type InFlight = { prev: any?, nextState: any?, handle: any?, at: number, gen: number }
+local _inFlight: { InFlight } = {}
+local _chainGen = 0 -- bumped by cancel(): a refusal never resurrects a cancelled drawing
+local MAX_IN_FLIGHT = 4
+-- The server refuses placements closer together than RoadConstants.PLACE_COOLDOWN.
+local MIN_SEND_GAP = RoadConstants.PLACE_COOLDOWN + 0.03
+local _lastSendAt = -math.huge
 local PLACEMENT_RESULT_TIMEOUT = 5
+
+local function applyState(st: any)
+	_start = st.start
+	_curve = st.curve
+	_curve2 = st.curve2
+	_freeformTangent = st.freeformTangent
+	_phase = st.phase
+end
 
 -- Current gesture state packaged for RoadPlacementSnapper.controlPoints.
 local function curveOpts(): Snapper.CurveOpts
@@ -437,11 +456,14 @@ local function updateRoundaboutGhost()
 end
 
 local function requestRoundabout(center: Vector3, radius: number)
-	if _pendingPlacement or not _placeRoundaboutRemote then return end
-	-- Reuse the place-result pending guard: success resets to Idle (clears the
-	-- centre), a rejection keeps the centre so the player can retry.
-	_pendingPlacement = { start = nil, curve = nil, curve2 = nil, freeformTangent = nil, phase = "Idle" }
-	_pendingSince = os.clock()
+	if #_inFlight > 0 or not _placeRoundaboutRemote then return end
+	-- Not predicted: success resets to Idle (clears the centre), a rejection keeps the
+	-- centre so the player can retry.
+	table.insert(_inFlight, {
+		nextState = { start = nil, curve = nil, curve2 = nil, freeformTangent = nil, phase = "Idle" },
+		at = os.clock(), gen = _chainGen,
+	})
+	_lastSendAt = os.clock()
 	_placeRoundaboutRemote:FireServer({ center = center, radius = radius, roadType = roundaboutRoadType(), preset = _roundaboutPreset })
 end
 
@@ -459,9 +481,11 @@ end
 local function updateGhost()
 	-- Watchdog: self-heal the placement guard if a PlaceRoadResult never came back, so a
 	-- failed roundabout/road request can't leave the tool permanently unresponsive.
-	if _pendingPlacement and _pendingSince and os.clock() - _pendingSince > PLACEMENT_RESULT_TIMEOUT then
-		_pendingPlacement = nil
-		_pendingSince = nil
+	local oldest = _inFlight[1]
+	if oldest and os.clock() - oldest.at > PLACEMENT_RESULT_TIMEOUT then
+		-- Any road that did get built is on screen for real by now.
+		for _, e in _inFlight do Prediction.resolve(e.handle, false) end
+		table.clear(_inFlight)
 		warn("[RoadPlacementController] placement result timed out -- resetting tool")
 	end
 
@@ -590,8 +614,7 @@ local function cancel()
 	_curve2 = nil
 	_freeformTangent = nil
 	_lastSnapResult = nil
-	_pendingPlacement = nil
-	_pendingSince = nil
+	_chainGen += 1
 	if _phase ~= "Disabled" then _phase = "Idle" end
 	GhostPreview.clear()
 	DeleteHover.ClearRoad()
@@ -618,33 +641,39 @@ local function attachParallelTwin(req: any)
 end
 
 local function requestPlacement(req: any, nextState: any)
-	if _pendingPlacement then return end
+	local now = os.clock()
+	if #_inFlight >= MAX_IN_FLIGHT or now - _lastSendAt < MIN_SEND_GAP then return end
 	attachParallelTwin(req)
-	_pendingPlacement = nextState
-	_pendingSince = os.clock()
+	table.insert(_inFlight, {
+		prev = { start = _start, curve = _curve, curve2 = _curve2, freeformTangent = _freeformTangent, phase = _phase },
+		handle = Prediction.show(req),
+		at = now, gen = _chainGen,
+	})
+	_lastSendAt = now
+	applyState(nextState) -- predicted: carry on drawing from the new road's end now
 	_placeRemote:FireServer(req)
 end
 
 local function onPlaceResult(ok: any, reason: any)
-	local pending = _pendingPlacement
-	_pendingPlacement = nil
-	_pendingSince = nil
-	if not pending then return end
+	local entry = table.remove(_inFlight, 1)
+	if not entry then return end
+	Prediction.resolve(entry.handle, ok == true)
 	if ok == true then
-		_start = pending.start
-		_curve = pending.curve
-		_curve2 = pending.curve2
-		_freeformTangent = pending.freeformTangent
-		_phase = pending.phase
-	elseif typeof(reason) == "string" then
-		warn("[RoadPlacementController] placement rejected: " .. reason)
-		NotificationController.Notify({ text = "Can't place: " .. reason, kind = "danger", duration = 3 })
+		if entry.nextState and entry.gen == _chainGen and _phase ~= "Disabled" then applyState(entry.nextState) end
+	else
+		if entry.prev and #_inFlight == 0 and entry.gen == _chainGen and _phase ~= "Disabled" then
+			applyState(entry.prev)
+		end
+		if typeof(reason) == "string" then
+			warn("[RoadPlacementController] placement rejected: " .. reason)
+			NotificationController.Notify({ text = "Can't place: " .. reason, kind = "danger", duration = 3 })
+		end
 	end
 	notify()
 end
 
 local function onClick()
-	if _pendingPlacement then return end
+	if #_inFlight >= MAX_IN_FLIGHT then return end
 	local rawCursor = cursorWorldPoint()
 	if not rawCursor then return end
 

@@ -148,7 +148,46 @@ local function armsForNode(nodeId: Types.NodeId): { IntersectionRenderer.Arm }
 	return arms
 end
 
-local function nodeArmBoundary(nodeId: Types.NodeId, segId: Types.SegmentId): number
+-- Junction geometry is asked for over and over while one piece renders: every trim, curb,
+-- crosswalk, lamp and sign asks where each arm's mouth is, and each answer rebuilt the node's
+-- arms from scratch -- thousands of rebuilds per placed road, measured as the largest share
+-- of a placement's server time (the frame every player waits on). The renderer only READS
+-- the network, so within one render call the answers cannot change: they are memoized while
+-- a render runs (depth > 0) and dropped when it returns. Outside a render -- RoadService's
+-- own trims around a network edit -- nothing is cached.
+local Memo = {
+	depth = 0,
+	junction = {} :: { [Types.NodeId]: { [Types.SegmentId]: number } },
+	nodeArm = {} :: { [Types.NodeId]: { [Types.SegmentId]: number } },
+}
+function Memo.get(cache: { [Types.NodeId]: { [Types.SegmentId]: number } }, nodeId: Types.NodeId, segId: Types.SegmentId,
+	compute: (Types.NodeId, Types.SegmentId) -> number): number
+	if Memo.depth == 0 then return compute(nodeId, segId) end
+	local byNode = cache[nodeId]
+	if not byNode then byNode = {}; cache[nodeId] = byNode end
+	local v = byNode[segId]
+	if v == nil then
+		v = compute(nodeId, segId)
+		byNode[segId] = v
+	end
+	return v
+end
+-- Wraps a public render entry point: the memo lives exactly as long as the outermost call.
+function Memo.scope<A..., R...>(fn: (A...) -> R...): (A...) -> R...
+	return function(...: A...): R...
+		Memo.depth += 1
+		local r = table.pack(pcall(fn, ...))
+		Memo.depth -= 1
+		if Memo.depth == 0 then
+			table.clear(Memo.junction)
+			table.clear(Memo.nodeArm)
+		end
+		if not r[1] then error(r[2], 0) end
+		return table.unpack(r, 2, r.n)
+	end
+end
+
+local function nodeArmBoundaryRaw(nodeId: Types.NodeId, segId: Types.SegmentId): number
 	local node = _network:getNodes()[nodeId]
 	if not node then
 		return 0
@@ -161,6 +200,9 @@ local function nodeArmBoundary(nodeId: Types.NodeId, segId: Types.SegmentId): nu
 		end
 	end
 	return nodeJunctionRadius(nodeId)
+end
+local function nodeArmBoundary(nodeId: Types.NodeId, segId: Types.SegmentId): number
+	return Memo.get(Memo.nodeArm, nodeId, segId, nodeArmBoundaryRaw)
 end
 
 -- Junction trim distance for an arm at an intersection. Starts from the corner-fillet
@@ -338,7 +380,7 @@ local function computeArmJunctionBoundary(nodeId: Types.NodeId, segId: Types.Seg
 end
 
 -- A shallow fork pushes both arm mouths back so the corner curb fits (see forkRequiredReach).
-local function armJunctionBoundary(nodeId: Types.NodeId, segId: Types.SegmentId): number
+local function armJunctionBoundaryRaw(nodeId: Types.NodeId, segId: Types.SegmentId): number
 	local reach = math.max(computeArmJunctionBoundary(nodeId, segId), forkRequiredReach(nodeId, segId))
 	-- Never reach past the segment's midpoint: when two junctions share a short link their
 	-- mouths meet there instead of crossing THROUGH each other (overlapping warped fills
@@ -360,6 +402,9 @@ local function armJunctionBoundary(nodeId: Types.NodeId, segId: Types.SegmentId)
 		reach = math.min(reach, math.max(segLen - 2, 1))
 	end
 	return reach
+end
+local function armJunctionBoundary(nodeId: Types.NodeId, segId: Types.SegmentId): number
+	return Memo.get(Memo.junction, nodeId, segId, armJunctionBoundaryRaw)
 end
 
 -- How far out this arm's zebra sits: at the arm's MOUTH -- exactly where its slab starts
@@ -3270,9 +3315,9 @@ function RoadSceneRenderer.syncDeadEnds()
 	end
 end
 
-RoadSceneRenderer.renderSegment = renderSegment
-RoadSceneRenderer.refreshNode = refreshNode
-RoadSceneRenderer.rerenderIntersectionApproaches = rerenderIntersectionApproaches
+RoadSceneRenderer.renderSegment = Memo.scope(renderSegment)
+RoadSceneRenderer.refreshNode = Memo.scope(refreshNode)
+RoadSceneRenderer.rerenderIntersectionApproaches = Memo.scope(rerenderIntersectionApproaches)
 RoadSceneRenderer.armMarkingSetback = armMarkingSetback
 RoadSceneRenderer.armJunctionBoundary = armJunctionBoundary
 RoadSceneRenderer.crosswalkSeat = crosswalkSeat

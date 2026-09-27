@@ -100,9 +100,22 @@ local function segHit(A: Segment, B: Segment): (number?, number?, Vector3?)
 		aPts[i + 1] = BezierUtil.point(A.p0, A.p1, A.p2, A.p3, i / CROSS_SAMPLES)
 		bPts[i + 1] = BezierUtil.point(B.p0, B.p1, B.p2, B.p3, i / CROSS_SAMPLES)
 	end
+	-- B's footprint: a piece of A outside it cannot cross B, so its 24 tests are skipped.
+	-- Only a cull -- the tests that do run, and their order, are unchanged.
+	local bMinX, bMaxX, bMinZ, bMaxZ = math.huge, -math.huge, math.huge, -math.huge
+	for _, p in bPts do
+		if p.X < bMinX then bMinX = p.X end
+		if p.X > bMaxX then bMaxX = p.X end
+		if p.Z < bMinZ then bMinZ = p.Z end
+		if p.Z > bMaxZ then bMaxZ = p.Z end
+	end
 	for i = 0, CROSS_SAMPLES - 1 do
 		local a1 = aPts[i + 1]
 		local a2 = aPts[i + 2]
+		if math.max(a1.X, a2.X) < bMinX or math.min(a1.X, a2.X) > bMaxX
+			or math.max(a1.Z, a2.Z) < bMinZ or math.min(a1.Z, a2.Z) > bMaxZ then
+			continue
+		end
 		local r = a2 - a1
 		for j = 0, CROSS_SAMPLES - 1 do
 			local b1 = bPts[j + 1]
@@ -2148,9 +2161,11 @@ function RoadNetwork.checkPlacement(self: RoadNetwork, p0: Vector3, p1: Vector3,
 	-- Broad-phase once per segment (not per sample): only segments whose hull can reach
 	-- the candidate's surface take part in the 40-sample overlap scan.
 	local nearSegs: { Segment } = {}
+	local nearBounds: { SegBounds } = {}
 	for _, entry in sc.near do
 		if boundsNear(sc.bounds, entry.bounds, newFoot + OVERLAP_SCAN_PAD) then
 			nearSegs[#nearSegs + 1] = entry.seg
+			nearBounds[#nearSegs] = entry.bounds
 		end
 	end
 	for i = 1, SAMPLES - 1 do
@@ -2160,7 +2175,13 @@ function RoadNetwork.checkPlacement(self: RoadNetwork, p0: Vector3, p1: Vector3,
 		local cflat = Vector3.new(ctan.X, 0, ctan.Z)
 		if cflat.Magnitude < 1e-4 then continue end
 		cflat = cflat.Unit
-		for _, seg in nearSegs do
+		for k, seg in nearSegs do
+			-- The curve lies inside its bounds circle, so a sample further than the overlap
+			-- distance from the circle cannot count: skip the closest-point search. Exact.
+			local b = nearBounds[k]
+			local reachK = b.r + (newFoot + RoadTypeCatalog.getOrDefault(seg.roadType).width * 0.5 + RoadConstants.SIDEWALK_WIDTH) * widthFactor
+			local bx, bz = cp.X - b.cx, cp.Z - b.cz
+			if bx * bx + bz * bz > reachK * reachK then continue end
 			local st = BezierUtil.closestParam(seg.p0, seg.p1, seg.p2, seg.p3, cp, 12)
 			local sp = BezierUtil.point(seg.p0, seg.p1, seg.p2, seg.p3, st)
 			if math.abs(sp.Y - cp.Y) <= RoadConstants.VERTICAL_CONNECT_TOLERANCE then

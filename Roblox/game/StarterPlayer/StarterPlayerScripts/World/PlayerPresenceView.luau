@@ -23,6 +23,11 @@ local PlayerPresenceView = {}
 
 local FOLDER_NAME = "_Presence"
 local REPORT_INTERVAL = 1 / 10
+-- Reports go up only when the camera or cursor moved, or once a second to stay listed
+-- (the server forgets a player after 3 s of silence).
+local REPORT_KEEPALIVE = 1
+local REPORT_MOVE_EPS = 0.25 -- studs
+local _lastReport: { pos: Vector3, aim: Vector3, at: number }? = nil
 local LINE_THICKNESS = 0.7
 local DISC_DIAMETER = 16
 local DISC_HEIGHT = 0.2
@@ -235,7 +240,15 @@ local function report(dt: number)
 	local aim = CursorRay.ground()
 	if not aim then return end
 
-	Net.ReportPresence:FireServer({ pos = camera.CFrame.Position, aim = aim })
+	local pos = camera.CFrame.Position
+	local now = os.clock()
+	local last = _lastReport
+	if last and now - last.at < REPORT_KEEPALIVE
+		and (pos - last.pos).Magnitude < REPORT_MOVE_EPS and (aim - last.aim).Magnitude < REPORT_MOVE_EPS then
+		return
+	end
+	_lastReport = { pos = pos, aim = aim, at = now }
+	Net.ReportPresence:FireServer({ pos = pos, aim = aim })
 end
 
 function PlayerPresenceView.Start()

@@ -682,13 +682,29 @@ type BakeJob = { key: string, detailsOnly: boolean }
 local _bakeQueue: { BakeJob } = {}
 local _queuedSet: { [string]: boolean } = {}
 local _pumping = false
+-- For RoadPlacementPrediction: rebuilds waiting out REBUILD_QUIET, and when a bake last
+-- finished -- together they say when a road that just replicated is on screen.
+local _scheduled = 0
+local _lastBakeAt = -math.huge
 
 local function enqueue(key: string, detailsOnly: boolean?)
 	local only = detailsOnly == true
 	local tag = if only then "d:" .. key else key
 	if _queuedSet[tag] then return end
 	_queuedSet[tag] = true
-	table.insert(_bakeQueue, { key = key, detailsOnly = only })
+	local job = { key = key, detailsOnly = only }
+	if only then
+		table.insert(_bakeQueue, job)
+	else
+		-- A road that was just built or changed (by anyone on the server) goes ahead of the
+		-- paint-only rebakes that flying the camera around queues up, so another player's
+		-- new road appears as soon as it replicates instead of after that backlog.
+		local at = #_bakeQueue + 1
+		for i, queued in _bakeQueue do
+			if queued.detailsOnly then at = i break end
+		end
+		table.insert(_bakeQueue, at, job)
+	end
 	if _pumping then return end
 	_pumping = true
 	task.spawn(function()
@@ -705,6 +721,7 @@ local function enqueue(key: string, detailsOnly: boolean?)
 					rebuild(job.key)
 				end
 			end)
+			if not job.detailsOnly then _lastBakeAt = os.clock() end
 			if not ok then
 				warn(`[RoadMeshView] bake job failed for cell {job.key}: {err}`)
 			end
@@ -718,7 +735,9 @@ local function schedule(key: string)
 	if not st then return end
 	st.version += 1
 	local v = st.version
+	_scheduled += 1
 	task.delay(REBUILD_QUIET, function()
+		_scheduled -= 1
 		local cur = _cells[key]
 		if cur and cur.version == v then
 			enqueue(key)
@@ -868,6 +887,16 @@ function RoadMeshView.Start()
 			end
 		end
 	end)
+end
+
+-- True when no road rebuild is waiting or baking on this client.
+function RoadMeshView.isIdle(): boolean
+	return _scheduled == 0 and not _pumping and #_bakeQueue == 0
+end
+
+-- os.clock() of the last finished road (not paint-only) bake.
+function RoadMeshView.lastBakeAt(): number
+	return _lastBakeAt
 end
 
 return RoadMeshView

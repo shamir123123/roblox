@@ -30,10 +30,17 @@ local MAX_COORD = 100000
 -- keeps their last marker this long, then drops out of the broadcast rather than hanging
 -- over the map forever.
 local STALE_AFTER = 3
+-- A row goes out again only when its player's camera or cursor has moved, or once per
+-- KEEPALIVE so the other clients' markers (dropped after 4 s unseen) stay up. A player
+-- sitting still costs nobody anything past that; the old every-row-every-tick broadcast
+-- grew with the square of the player count.
+local KEEPALIVE = 1
+local MOVE_EPS = 0.25 -- studs
 
 type Presence = { pos: Vector3, aim: Vector3, name: string, at: number }
 
 local _state: { [number]: Presence } = {}
+local _sent: { [number]: { pos: Vector3, aim: Vector3, at: number } } = {}
 local _lastReportAt: { [number]: number } = {}
 local _net: any = nil
 local _bound = false
@@ -76,8 +83,15 @@ local function broadcast()
 	for userId, p in _state do
 		if now - p.at > STALE_AFTER then
 			_state[userId] = nil
+			_sent[userId] = nil
 			continue
 		end
+		local last = _sent[userId]
+		if last and now - last.at < KEEPALIVE
+			and (p.pos - last.pos).Magnitude < MOVE_EPS and (p.aim - last.aim).Magnitude < MOVE_EPS then
+			continue
+		end
+		_sent[userId] = { pos = p.pos, aim = p.aim, at = now }
 		table.insert(rows, { id = userId, name = p.name, pos = p.pos, aim = p.aim })
 	end
 	if #rows == 0 then return end
@@ -102,6 +116,7 @@ function PlayerPresenceService.Bind()
 
 	Players.PlayerRemoving:Connect(function(player)
 		_state[player.UserId] = nil
+		_sent[player.UserId] = nil
 		_lastReportAt[player.UserId] = nil
 	end)
 
