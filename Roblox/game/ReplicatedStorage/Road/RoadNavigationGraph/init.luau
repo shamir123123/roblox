@@ -1378,11 +1378,25 @@ function RoadNavigationGraph._rebuildConnectionsForNodes(self: any, network: any
 		-- At a roundabout node the junction lane policy does not apply (every movement is a
 		-- merge or a diverge); roundaboutLaneAllowed keeps each car in its lane instead.
 		local isRA = network.isRoundaboutNode ~= nil and network:isRoundaboutNode(nodeId)
+		-- A ramp or street joining a DIVIDED highway from one side is right-in/right-out: the
+		-- median runs straight past it, so no movement may cut across it -- neither turning off
+		-- the far carriageway nor turning onto it. Those turns used to be allowed, and cars
+		-- crossed the median at every slip road.
+		local hwKind, hwDivided = RoadRules.highwayJunction(network, nodeId)
+		local rightInRightOut = hwKind == "onesided" and hwDivided
 		for _, inEdge in incoming do
 			local autoPlans = buildAutoExitPlans(inEdge, outgoing, #node.segments)
 			for _, outEdge in outgoing do
 				local plan = autoPlans[outEdge.segmentId] or { movement = classifyTurn(inEdge.toDir, outEdge.fromDir) }
 				local movement = plan.movement
+				if rightInRightOut and (movement == RoadRules.getCrossingTurn() or movement == "uturn") then
+					continue
+				end
+				-- Nobody turns round on a highway at a junction, whatever the node's turn
+				-- settings say (a dead end is the only place a highway lane may turn back).
+				if movement == "uturn" and inEdge.roadClass == "highway" and #node.segments >= 2 then
+					continue
+				end
 				local explicitRule = connectionRules and connectionRules[connectionKey(inEdge.id, outEdge.id)]
 				local usesDefaultLanePolicy = not manual and explicitRule == nil
 				local laneAllowed = not usesDefaultLanePolicy
@@ -2164,8 +2178,8 @@ end
 -- `profile` (DriverProfile, optional) is the asking driver's own mind -- see NavRouter.
 -- Passing none returns the objective shortest/fastest route, which is what buses,
 -- trains and emergency vehicles want.
-function RoadNavigationGraph.FindPath(self: any, startPos: Vector3, goalPos: Vector3, allowCrossing: boolean?, vehicleClass: string?, profile: any?): ({ Vector3 }?, { string }?)
-	return NavRouter.findPath(self, startPos, goalPos, allowCrossing, vehicleClass, profile)
+function RoadNavigationGraph.FindPath(self: any, startPos: Vector3, goalPos: Vector3, allowCrossing: boolean?, vehicleClass: string?, profile: any?, startLane: NavRouter.StartLane?): ({ Vector3 }?, { string }?)
+	return NavRouter.findPath(self, startPos, goalPos, allowCrossing, vehicleClass, profile, startLane)
 end
 
 return RoadNavigationGraph

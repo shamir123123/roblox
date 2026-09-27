@@ -46,10 +46,15 @@ export type LeftMode = "auto" | "permissive" | "protected" | "ppLeft" | "split"
 export type PedMode = "none" | "concurrent" | "scramble"
 
 export type CycleMode = "adaptive" | "fixed"
+-- Whether the junction has lights at all. "auto" follows the road hierarchy
+-- (RoadRules.nodeControl); "signal" puts lights up where the rules would not; "priority"
+-- takes them down and runs the junction on give-way.
+export type ControlMode = "auto" | "signal" | "priority"
 
 SignalSpec.LEFT_MODES = table.freeze({ "auto", "permissive", "protected", "ppLeft", "split" })
 SignalSpec.PED_MODES = table.freeze({ "none", "concurrent", "scramble" })
 SignalSpec.CYCLE_MODES = table.freeze({ "adaptive", "fixed" })
+SignalSpec.CONTROL_MODES = table.freeze({ "auto", "signal", "priority" })
 
 -- Two label sets, because five options have to fit a 240px chip row. LABELS is what
 -- goes on the chips; NAMES is the readable form for hints and list rows. Both live
@@ -237,6 +242,10 @@ export type SignalPlan = {
 	-- Which phase index the offset is measured against -- the coordinated phase,
 	-- conventionally the main street's through movement.
 	coordPhase: number,
+
+	-- Lights on, off, or as the road hierarchy decides. Applies whether or not `custom` is
+	-- set: it is about whether there ARE lights, not how they are timed.
+	control: ControlMode,
 }
 
 function SignalSpec.defaultPlan(): SignalPlan
@@ -260,6 +269,7 @@ function SignalSpec.defaultPlan(): SignalPlan
 		groupId = nil,
 		offset = 0,
 		coordPhase = 1,
+		control = "auto",
 	}
 end
 
@@ -291,6 +301,7 @@ function SignalSpec.sanitizePlan(raw: any): SignalPlan
 	plan.cycleMode = oneOf(raw.cycleMode, SignalSpec.CYCLE_MODES, "adaptive") :: CycleMode
 	plan.pedMode = oneOf(raw.pedMode, SignalSpec.PED_MODES, "scramble") :: PedMode
 	plan.leadingLefts = raw.leadingLefts ~= false
+	plan.control = oneOf(raw.control, SignalSpec.CONTROL_MODES, "auto") :: ControlMode
 
 	for _, key in { "cycle", "minGreen", "maxGreen", "leftMinGreen", "leftMaxGreen",
 		"secPerCar", "yellow", "allRed", "pedWalk", "pedEveryNCycles", "offset" } do

@@ -78,9 +78,10 @@ end
 function SignalPlanStore.setPlan(nodeId: number, raw: any): SignalPlan
 	local plan = SignalSpec.sanitizePlan(raw)
 
-	-- A plan that is back on auto with no group membership carries no information;
-	-- dropping it keeps the save small and the store honest about what is customised.
-	if not plan.custom and not plan.groupId then
+	-- A plan that is back on auto with no group membership and no lights choice carries no
+	-- information; dropping it keeps the save small and the store honest about what is
+	-- customised.
+	if not plan.custom and not plan.groupId and plan.control == "auto" then
 		if _plans[nodeId] then
 			_plans[nodeId] = nil
 			notify(nodeId)
@@ -97,6 +98,14 @@ function SignalPlanStore.setPlan(nodeId: number, raw: any): SignalPlan
 	_plans[nodeId] = plan
 	notify(nodeId)
 	return plan
+end
+
+-- Lights on / off / automatic at one junction, leaving its timings as they are. Saved with
+-- the plan (by position), so the player's choice survives a reload.
+function SignalPlanStore.setControl(nodeId: number, control: SignalSpec.ControlMode): SignalPlan
+	local raw = table.clone(_plans[nodeId] or SignalSpec.defaultPlan()) :: any
+	raw.control = control
+	return SignalPlanStore.setPlan(nodeId, raw)
 end
 
 function SignalPlanStore.clearPlan(nodeId: number)
@@ -334,6 +343,7 @@ function SignalPlanStore.serialize(): { [string]: any }?
 			groupId = plan.groupId,
 			offset = plan.offset,
 			coordPhase = plan.coordPhase,
+			control = plan.control,
 		})
 	end
 

@@ -201,6 +201,10 @@ type DriverState = PathFollower.FollowerState & {
 	laneChange: LaneChange?,    -- the move in progress; only valid while `connector` is its ribbon
 	mergeInto: string?,         -- lane this car has waited LaneChange.MERGE_COURTESY_WAIT+ to move into (zipper)
 	mergeHoldAt: number?,       -- swap tie-break winner: hold point pulled up past the other car
+	nextLaneLook: number?,      -- _simClock of this car's next lane-discipline look (highways)
+	laneDisciplineMoves: number?, -- debug: overtakes and returns taken
+	heldUpSince: number?,       -- _simClock since a slower car ahead has been holding this one up
+	laneMoveKinds: { [string]: number }?, -- debug: discipline moves by kind (yield / pass / back)
 }
 
 -- Route bookings are keyed by an integer that must be unique across LIVE trips, so a
@@ -564,8 +568,10 @@ end
 
 local flatUnit: (Vector3?) -> Vector3
 
+local _ringByEdge: { [string]: any } = {} -- roundabout rings, see ringOf
 local function clearGraphCaches()
 	table.clear(_nodeMetaById)
+	table.clear(_ringByEdge)
 end
 
 local function getNodeMeta(g: any, nodeId: number): any
@@ -687,6 +693,39 @@ local function getNodeMeta(g: any, nodeId: number): any
 		end
 	end
 
+	-- A ramp or street joining a divided highway from one side (right-in/right-out, see
+	-- RoadRules.highwayJunction): the median separates the far carriageway from everything
+	-- that happens here, so cars on opposite sides of it never wait for each other.
+	-- farSide[laneId] is true for the lanes arriving on the far side of the median.
+	meta.farSide = {}
+	if node and network then
+		local kind, divided = RoadRules.highwayJunction(network, nodeId)
+		if kind == "onesided" and divided then
+			local function dividedHighway(segId: number): boolean
+				local seg = network:getSegment(segId)
+				local spec = RoadTypeCatalog.getOrDefault(seg and seg.roadType)
+				return spec.isHighway == true and spec.median == true and not spec.oneWay
+			end
+			-- The side the ramp / street comes from.
+			local sideDir: Vector3? = nil
+			for _, sid in node.segments do
+				local seg = network:getSegment(sid)
+				if seg and not dividedHighway(sid) then
+					local far = if seg.startNode == nodeId then seg.p3 else seg.p0
+					local d = Vector3.new(far.X - node.position.X, 0, far.Z - node.position.Z)
+					if d.Magnitude > 1e-3 then sideDir = d.Unit end
+				end
+			end
+			if sideDir then
+				for _, e in incomingEdges do
+					local last = e.points[#e.points]
+					if dividedHighway(e.segmentId) and last and (last - node.position):Dot(sideDir) < 0 then
+						meta.farSide[e.id] = true
+					end
+				end
+			end
+		end
+	end
 	_nodeMetaById[nodeId] = meta
 	return meta
 end
@@ -865,11 +904,15 @@ local function unsignalizedClear(g: any, state: DriverState, edge: any, nodeId: 
 	local myPriority = getArmPriority(g, nodeId, edge.id)
 	local myPos = getStatePosition(state)
 
+	local farSide = getNodeMeta(g, nodeId).farSide
+	local myFar = farSide[edge.id] == true
+
 	-- Cars crossing the node now.
 	for _, other in _connByLandingNode[nodeId] or EMPTY do
 		if other == state or not other.model.Parent or not (other.connector and other.nextEdgeId) then continue end
 		local otherNextEdge = g:GetEdge(other.nextEdgeId)
 		if not otherNextEdge or otherNextEdge.fromNode ~= nodeId or other.edgeId == edge.id then continue end
+		if (farSide[other.edgeId] == true) ~= myFar then continue end
 		local otherEdge = g:GetEdge(other.edgeId)
 		if not otherEdge then continue end
 		if isOpposite(myDir, otherEdge.toDir) then
@@ -882,7 +925,7 @@ local function unsignalizedClear(g: any, state: DriverState, edge: any, nodeId: 
 
 	-- Approaching cars near the line.
 	for _, otherEdge in g._edgesByToNode[nodeId] or EMPTY do
-		if otherEdge.id == edge.id then continue end
+		if otherEdge.id == edge.id or (farSide[otherEdge.id] == true) ~= myFar then continue end
 		for _, other in _edgeDriverIndex[otherEdge.id] or EMPTY do
 			if other == state or other.connector or other.edgeId ~= otherEdge.id or not other.model.Parent then continue end
 			if etaToStopLine(g, other, otherEdge, nodeId) >= CROSS_GAP_TIME then continue end
@@ -952,6 +995,64 @@ local function roundaboutClear(g: any, state: DriverState, nodeId: number, nodeP
 	return true
 end
 
+-- A ring's lanes and how many queued cars they hold. Built per ring on first use; a graph
+-- rebuild drops them (clearGraphCaches).
+type Ring = { edges: { string }, capacity: number }
+local RING_SLOT = 22 * WS   -- studs of ring lane one queued car takes (measured ~10.5 centre to centre)
+local RING_RESERVE = 1      -- slots entering traffic always leaves free
+
+local function ringOf(g: any, edge: any): Ring
+	local ring = _ringByEdge[edge.id]
+	if ring then return ring end
+	local edges: { string } = {}
+	local seen: { [string]: boolean } = { [edge.id] = true }
+	local stack = { edge }
+	local length = 0
+	while #stack > 0 do
+		local e = table.remove(stack) :: any
+		table.insert(edges, e.id)
+		length += e.length or 0
+		for _, outId in e.out or EMPTY do
+			local o = g:GetEdge(outId)
+			if o and o.isRoundabout and not seen[outId] then
+				seen[outId] = true
+				table.insert(stack, o)
+			end
+		end
+	end
+	ring = { edges = edges, capacity = math.max(2, math.floor(length / RING_SLOT)) }
+	for _, id in edges do _ringByEdge[id] = ring end
+	return ring
+end
+
+-- Room on the ring for one more car. A ring packed full is a circle of cars each waiting
+-- for the one ahead -- none can move, and a car that wants to leave is stuck behind the
+-- car in front of it just the same. That deadlock was reachable: an entry that waited its
+-- IMPATIENCE_TIME noses in regardless of circulating traffic, and a busy ring filled up.
+-- Entries therefore always leave RING_RESERVE slots free, so the circle keeps moving.
+local function ringHasRoom(g: any, ringEdge: any): boolean
+	local ring = ringOf(g, ringEdge)
+	local limit = ring.capacity - RING_RESERVE
+	local count = 0
+	-- Connector cars are indexed by the lane they are heading into, lane cars by their lane:
+	-- counting both covers every car on the ring, every car already committed onto it, and
+	-- (from the exits' side) every car still turning off it.
+	for _, id in ring.edges do
+		for _, other in _edgeDriverIndex[id] or EMPTY do
+			if other.edgeId == id and other.model.Parent then count += 1 end
+		end
+		for _, other in _connectorByNextEdgeIndex[id] or EMPTY do
+			if other.model.Parent then count += 1 end
+		end
+		for _, other in _connectorByFromEdgeIndex[id] or EMPTY do
+			local nextE = other.model.Parent and other.nextEdgeId and g:GetEdge(other.nextEdgeId)
+			if nextE and not nextE.isRoundabout then count += 1 end
+		end
+		if count >= limit then return false end
+	end
+	return true
+end
+
 -- True while a car on a CONFLICTING path is physically inside this junction (on its connector
 -- through the node). The impatience escape exists to break standoffs between cars WAITING at
 -- the lines; it must never send a car into one that is already crossing -- that is how
@@ -978,8 +1079,11 @@ local function distToStopLine(g: any, other: DriverState, otherEdge: any, nodeId
 end
 
 local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
+	local farSide = getNodeMeta(g, nodeId).farSide
+	local myFar = farSide[edge.id] == true
 	for _, other in _connByLandingNode[nodeId] or EMPTY do
 		if other == state or not other.connector or not other.nextEdgeId or not other.model.Parent then continue end
+		if (farSide[other.edgeId] == true) ~= myFar then continue end
 		local otherNext = g:GetEdge(other.nextEdgeId)
 		if not otherNext or otherNext.fromNode ~= nodeId then continue end
 		local otherEdge = g:GetEdge(other.edgeId)
@@ -990,7 +1094,7 @@ local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: num
 	-- A car over its stop line has committed and will not stop, but its path through the box
 	-- only starts at the junction mouth a few studs on: until then it is in the box all the same.
 	for _, inEdge in g._edgesByToNode[nodeId] or {} do
-		if inEdge.segmentId == edge.segmentId then continue end
+		if inEdge.segmentId == edge.segmentId or (farSide[inEdge.id] == true) ~= myFar then continue end
 		for _, other in _edgeDriverIndex[inEdge.id] or {} do
 			local otherNextId = other.pendingNextEdgeId
 			if other == state or other.connector or not otherNextId or not other.model.Parent then continue end
@@ -1044,6 +1148,8 @@ end
 local function owesCourtesy(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
 	local claimant, claimEdge = junctionClaimant(g, nodeId)
 	if not claimant or claimant == state or claimEdge.segmentId == edge.segmentId then return false end
+	local farSide = getNodeMeta(g, nodeId).farSide
+	if (farSide[claimEdge.id] == true) ~= (farSide[edge.id] == true) then return false end
 	local claimMove = claimEdge.outMovement and claimEdge.outMovement[claimant.pendingNextEdgeId] or "straight"
 	return movesConflict(myDir, myMove, claimEdge, claimMove)
 end
@@ -1085,7 +1191,7 @@ local function canEnterIntersection(g: any, state: DriverState, edge: any, nextE
 	do
 		local nextEdge = g:GetEdge(nextEdgeId)
 		if nextEdge and nextEdge.isRoundabout then
-			if not exitLaneHasRoom(g, state, nextEdgeId) then
+			if not exitLaneHasRoom(g, state, nextEdgeId) or not ringHasRoom(g, nextEdge) then
 				return false
 			end
 			if (state.blockedTime or 0) >= IMPATIENCE_TIME then
@@ -1977,7 +2083,31 @@ local LaneChange = table.freeze({
 	MERGE_COURTESY_WAIT = 1, -- s a merger waits before the lane beside it makes room
 	MERGE_ROOM = 1,        -- studs past a follow gap a yielding car leaves, so the merger's check passes
 	SWAP_PULL_UP_MAX = 14, -- studs past the window end a swap winner may pull up (lands <= 7 into the solid zone)
+	-- The steepest a car's heading may swing off its lane while moving over: gentle at speed,
+	-- as a real lane change is (a few degrees on a motorway), steeper only at a crawl. The
+	-- ribbon is a smoothstep, whose steepest point is 1.5x its average slope, so a move of
+	-- `lateral` studs needs at least 1.5 * lateral / tan(angle) of road. Before this a slow or
+	-- held car got 7-14 studs to cross a whole lane -- a sideways hop at ~60-90 degrees.
+	MAX_ANGLE_SLOW = math.rad(24), -- at a standstill
+	MAX_ANGLE_FAST = math.rad(6),  -- at FAST_SPEED and above
+	FAST_SPEED = 50 * WS,          -- studs/s (~90 km/h)
 })
+
+-- Shortest stretch of road a move of `lateral` studs sideways may take at `speed`.
+local function laneChangeMinLength(lateral: number, speed: number): number
+	local t = math.clamp(speed / LaneChange.FAST_SPEED, 0, 1)
+	local angle = LaneChange.MAX_ANGLE_SLOW + (LaneChange.MAX_ANGLE_FAST - LaneChange.MAX_ANGLE_SLOW) * t
+	return 1.5 * lateral / math.tan(angle)
+end
+
+-- How much earlier than the window's end a car waiting to move over stops, so that the gentle
+-- move it makes from a standstill lands where the old 7-stud hop did -- short of the stop line.
+local function laneChangeHoldBack(g: any, edge: any, targetId: string): number
+	local target = g:GetEdge(targetId)
+	if not target then return 0 end
+	local lateral = math.abs((edge.offset or 0) - (target.offset or 0))
+	return math.max(0, laneChangeMinLength(lateral, 0) - (g.LANE_CHANGE_MIN_LENGTH or 14) * 0.5)
+end
 
 -- The route's next step when it is a lane change on this road: target lane plus the stretch
 -- of this lane over which the move may start. nil when the next step is a junction.
@@ -2002,6 +2132,13 @@ local function laneChangeGapClear(state: DriverState, targetId: string, d0: numb
 		if other ~= state and other.model.Parent then
 			local p = lanePos(other, targetId)
 			local behind = followGap(other, state) + (other.currentSpeed or 0) * 1.2 * squeeze
+			-- A car STANDING behind our start only needs its bumper kept clear: we pull off
+			-- ahead of it and it is not coming at us. Without this two stopped cars side by
+			-- side, each waiting for the other's lane, could never untangle -- the one in
+			-- front was always "too close" to the one behind.
+			if p <= d0 and (other.currentSpeed or 0) < 0.5 then
+				behind = (other.halfLength or 0) + (state.halfLength or 0) + FOLLOW_BUMPER
+			end
 			if p > d0 - behind and p < d1 + followGap(state, other) then
 				if other.mergeInto == state.edgeId then return false, other end
 				clear = false
@@ -2038,9 +2175,13 @@ local function tryStartLaneChange(g: any, state: DriverState, edge: any, targetI
 	-- Land no nearer the junction than the window's own shortest move would.
 	local margin = math.max(0, fromCum[#fromCum] - latest - minLength)
 	local d0 = state.edgeDist
-	local length = math.max(minLength, (state.currentSpeed or 0) * LaneChange.TIME)
-	-- A car held past the window end (swap winner, re-plan) still gets the shortest move.
-	local shortest = d0 + minLength * 0.5
+	local speed = state.currentSpeed or 0
+	local lateral = math.abs((edge.offset or 0) - (target.offset or 0))
+	local gentle = laneChangeMinLength(lateral, speed)
+	local length = math.max(minLength, gentle, speed * LaneChange.TIME)
+	-- A car held past the window end (swap winner, re-plan) still gets a move it can make
+	-- without swerving: never shorter than the gentle length at a crawl.
+	local shortest = d0 + math.max(minLength * 0.5, laneChangeMinLength(lateral, 0))
 	local d1 = math.clamp(d0 + length, shortest, math.max(shortest, toCum[#toCum] - margin))
 	-- The first half of the move still runs forward in THIS lane. Started with a car stopped
 	-- close in front, it stalled half across -- blocking both lanes until that queue moved.
@@ -2095,6 +2236,15 @@ local function deferLaneChange(g: any, state: DriverState, edge: any, targetId: 
 	return false
 end
 
+-- Which of two cars each waiting for the other's lane goes first: the one further along --
+-- it merges in front of the other without having to pull past it (which it may have no road
+-- left to do, at the end of the window). Level, the unique id decides.
+local function swapGoesFirst(a: DriverState, b: DriverState): boolean
+	local da, db = a.edgeDist or 0, b.edgeDist or 0
+	if math.abs(da - db) > 1 then return da > db end
+	return goesFirst(a, b)
+end
+
 -- A move refused this tick: count the wait, ask the lane beside to make room, and settle a
 -- swap. Two cars side by side each waiting for the other's lane can never both go; the
 -- tie-break winner pulls up past the other and merges in front of it, freeing the loser's gap.
@@ -2103,8 +2253,12 @@ local function waitForMerge(state: DriverState, targetId: string, latest: number
 	if (state.laneChangeWait or 0) >= LaneChange.MERGE_COURTESY_WAIT then
 		state.mergeInto = targetId
 	end
-	if swapWith and not swapWith.connector and goesFirst(state, swapWith) then
-		state.mergeHoldAt = math.min(lanePos(swapWith, targetId) + followGap(state, swapWith) + LaneChange.MERGE_ROOM, latest + LaneChange.SWAP_PULL_UP_MAX)
+	if swapWith and not swapWith.connector and swapGoesFirst(state, swapWith) then
+		local g = nav()
+		local edge = g and g:GetEdge(state.edgeId)
+		local holdBack = if g and edge then laneChangeHoldBack(g, edge, targetId) else 0
+		state.mergeHoldAt = math.min(lanePos(swapWith, targetId) + followGap(state, swapWith) + LaneChange.MERGE_ROOM,
+			latest - holdBack + LaneChange.SWAP_PULL_UP_MAX)
 	end
 end
 
@@ -2125,6 +2279,220 @@ local function getMergeCourtesy(state: DriverState): (DriverState?, number?)
 		end
 	end
 	return merger, if merger then best - LaneChange.MERGE_ROOM else nil
+end
+
+-- == Lane discipline (highways) ================================================
+-- The rule, as the player set it:
+--   * A car may stay in its lane -- the kerbside (right) lane included -- for as long as the
+--     car behind it is no faster than it is.
+--   * When a FASTER car closes on it from behind, it moves over so the faster car can keep
+--     going straight: out of the kerbside lane that is to the left; from any other lane it is
+--     back toward the kerb when that lane is free (keep right), otherwise further left.
+--   * Once it has been passed it may go back: to the kerbside lane, or to a middle lane for a
+--     quicker driver on a road of 3+ lanes (the middle lanes are for cruising) -- and only
+--     into a lane where nothing faster is closing from behind, so it never cuts one off.
+--   * A car held behind a slower one that could NOT step aside (the lane beside was full)
+--     passes it on the left itself after OVERTAKE_PATIENCE.
+-- The route decides lanes, so every move is a re-plan from the lane beside -- taken only when
+-- it costs next to nothing, which is also what keeps a car that needs the next exit in the
+-- lane it needs.
+local Discipline = table.freeze({
+	LOOK_EVERY = 2,            -- s between a car's looks at its lane
+	YIELD_BEHIND = 100 * WS,   -- studs behind a car it watches for faster traffic...
+	YIELD_TIME = 3,            -- ...or this many seconds of road at its speed, whichever is more
+	YIELD_MARGIN = 0.05,       -- a car behind counts as faster when it wants to go this much quicker
+	OVERTAKE_AHEAD = 70 * WS,  -- studs: a slower car this close ahead is holding us up...
+	OVERTAKE_MARGIN = 0.08,    -- ...when it is at least this much slower than we want to go
+	OVERTAKE_PATIENCE = 4,     -- s held up before we pass it ourselves (it could not move over)
+	RETURN_CLEAR = 90 * WS,    -- studs of the lane we move back into that must hold nobody slower...
+	RETURN_TIME = 4,           -- ...or this many seconds of it at our speed, whichever is more
+	SETTLE = 5,                -- s after a move before the car considers another
+	FAST_DRIVER = 0.99,        -- speedFactor above which a car cruises in a middle lane (about half)
+	EXIT_CLEAR = 400 * WS,     -- studs before the car leaves the highway (or ends its trip) with no moves
+	KEEP_LANE = 300 * WS,      -- a move whose plan changes lane again sooner than this is not taken
+	MAX_EXTRA_SECONDS = 6,     -- the plan from the lane beside may cost this much more than ours
+})
+
+-- The slowest car in `laneId` between `from` and `to` (distances along it), or nil.
+local function slowestIn(laneId: string, from: number, to: number, except: DriverState): number?
+	local slowest: number? = nil
+	for _, bucket in { _edgeDriverIndex[laneId], _connectorByNextEdgeIndex[laneId] } do
+		for _, other in bucket or EMPTY do
+			if other == except or not other.model.Parent then continue end
+			local p = lanePos(other, laneId)
+			if p > from and p < to then
+				local v = other.currentSpeed or 0
+				if not slowest or v < slowest then slowest = v end
+			end
+		end
+	end
+	return slowest
+end
+
+-- True when a car that wants to go faster than `mySpeed` (desired, studs/s) is in `lane`
+-- between `range` studs behind `pos` and `pos`, and is not falling back. Looks back onto the
+-- lane that runs straight into this one too: the highway is a chain of pieces.
+local function fasterBehind(g: any, lane: any, pos: number, range: number, mySpeed: number, except: DriverState): boolean
+	local function check(laneId: string, laneEdge: any, from: number, to: number): boolean
+		for _, bucket in { _edgeDriverIndex[laneId], _connectorByNextEdgeIndex[laneId] } do
+			for _, other in bucket or EMPTY do
+				if other == except or not other.model.Parent then continue end
+				local p = lanePos(other, laneId)
+				if p > from and p < to
+					and driverSpeed(laneEdge, other) > mySpeed * (1 + Discipline.YIELD_MARGIN)
+					and (other.currentSpeed or 0) >= (except.currentSpeed or 0) * 0.95 then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	if check(lane.id, lane, pos - range, pos) then return true end
+	local short = range - pos
+	if short > 0 then
+		for _, inE in g._edgesByToNode[lane.fromNode] or EMPTY do
+			if inE.outMovement and inE.outMovement[lane.id] == "straight" and inE.length
+				and check(inE.id, inE, inE.length - short, inE.length + 1) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Studs of highway ahead on the route before it leaves the highway or ends. Lane-change steps
+-- (two lanes of one road piece in a row) are counted once.
+local function highwayLeft(g: any, route: { string }, index: number, edgeDist: number): number
+	local total = -edgeDist
+	local prevSeg: any = nil
+	for i = index, #route do
+		local e = g:GetEdge(route[i])
+		if not e or e.roadClass ~= "highway" then break end
+		if e.segmentId ~= prevSeg then
+			total += e.length or 0
+			prevSeg = e.segmentId
+		end
+		if total >= Discipline.EXIT_CLEAR then break end
+	end
+	return total
+end
+
+local function tryLaneDiscipline(g: any, state: DriverState, edge: any)
+	local route = state.route
+	if not route or not state.goalPos or edge.roadClass ~= "highway" or not edge.laneChangeOk
+		or (edge.laneCountInDirection or 1) < 2 then
+		return
+	end
+	if _simClock < (state.nextLaneLook or 0) then return end
+	state.nextLaneLook = _simClock + Discipline.LOOK_EVERY * (0.75 + math.random() * 0.5)
+	-- Near the exit (or the end of the trip) a driver gets in lane and stays there.
+	if highwayLeft(g, route, state.routeIndex or 1, state.edgeDist) < Discipline.EXIT_CLEAR then return end
+
+	local desired = driverSpeed(edge, state)
+	local speed = state.currentSpeed or 0
+	local ord = edge.laneOrdinal
+	local count = edge.laneCountInDirection
+	local myPos = state.edgeDist
+	local lookBack = math.max(Discipline.YIELD_BEHIND, speed * Discipline.YIELD_TIME)
+	local clearAhead = math.max(Discipline.RETURN_CLEAR, speed * Discipline.RETURN_TIME)
+
+	local lanes: { [number]: any } = {}
+	for _, id in g:GetLaneChangeTargets(edge.id) do
+		local e = g:GetEdge(id)
+		if e and edgeAllows(e, state.vehicleClass) then lanes[e.laneOrdinal] = e end
+	end
+	-- A lane we could move into here, with nothing faster coming up behind us in it.
+	local function open(o: number): any?
+		local e = lanes[o]
+		if not e then return nil end
+		local earliest, latest = g:GetLaneChangeWindow(edge.id, e.id)
+		if not earliest or not latest or myPos > latest then return nil end
+		if fasterBehind(g, e, myPos, lookBack, desired, state) then return nil end
+		return e
+	end
+
+	local lead, gap = getNearestQueueLeader(state)
+	local leadSpeed = if lead then (lead.currentSpeed or 0) else math.huge
+	local heldUp = lead ~= nil and gap ~= nil and gap < Discipline.OVERTAKE_AHEAD
+		and leadSpeed < desired * (1 - Discipline.OVERTAKE_MARGIN)
+	if heldUp then
+		state.heldUpSince = state.heldUpSince or _simClock
+	else
+		state.heldUpSince = nil
+	end
+
+	local target: any? = nil
+	local kind = "back"
+	if fasterBehind(g, edge, myPos, lookBack, desired, state) then
+		kind = "yield"
+		-- Let it through: out of the kerbside lane to the left; from any other lane back
+		-- toward the kerb if that is free, else on to the left.
+		if ord == count then
+			target = open(ord - 1)
+		else
+			target = open(ord + 1) or (if ord > 1 then open(ord - 1) else nil)
+		end
+		-- Never into a lane where we would sit right behind something slower.
+		if target and (slowestIn(target.id, myPos - followGap(state, nil), myPos + Discipline.OVERTAKE_AHEAD, state) or math.huge)
+			< speed * 0.9 then
+			target = nil
+		end
+	elseif heldUp and ord > 1 and _simClock - (state.heldUpSince or _simClock) >= Discipline.OVERTAKE_PATIENCE then
+		-- The car ahead could not move over: pass it on the left, into a lane moving better.
+		kind = "pass"
+		local e = open(ord - 1)
+		local there = e and slowestIn(e.id, myPos - followGap(state, nil), myPos + Discipline.OVERTAKE_AHEAD * 1.5, state)
+		if e and not (there and there <= leadSpeed * 1.05) then target = e end
+	else
+		-- Passed (or nobody behind): back toward the lane this driver cruises in, when it is
+		-- free a good way ahead.
+		local fast = (if state.profile then state.profile.speedFactor else 1) > Discipline.FAST_DRIVER
+		local home = if fast and count >= 3 then count - 1 else count
+		if ord < home then
+			local e = open(ord + 1)
+			local there = e and slowestIn(e.id, myPos - followGap(state, nil), myPos + clearAhead, state)
+			if e and not (there and there < desired * 0.95) then target = e end
+		end
+	end
+	if not target then return end
+
+	local lateral = math.abs((edge.offset or 0) - (target.offset or 0))
+	local earliest = g:GetLaneChangeWindow(edge.id, target.id)
+	local landAt = math.max(myPos, earliest or myPos) + laneChangeMinLength(lateral, speed)
+	local ok, _, tail = pcall(function()
+		return g:FindPath(getStatePosition(state), state.goalPos, nil, state.vehicleClass, state.profile,
+			{ edgeId = target.id, dist = landAt })
+	end)
+	if not ok or typeof(tail) ~= "table" or tail[1] ~= target.id then return end
+	-- Not a move that has to be undone straight away (the plan from there changes lane again).
+	do
+		local run = -landAt
+		for i = 1, #tail - 1 do
+			local a, b = g:GetEdge(tail[i]), g:GetEdge(tail[i + 1])
+			if not a or not b then break end
+			run += a.length or 0
+			if run >= Discipline.KEEP_LANE then break end
+			if a.segmentId == b.segmentId then return end
+		end
+	end
+	local index = state.routeIndex or 1
+	local oldCost = g:EstimatePathCost(route, index, state.profile)
+	local newCost = g:EstimatePathCost(tail, 1, state.profile)
+	if oldCost == math.huge or newCost > oldCost + Discipline.MAX_EXTRA_SECONDS then return end
+
+	local newRoute = table.move(route, 1, index, 1, {})
+	table.move(tail, 1, #tail, index + 1, newRoute)
+	state.route = newRoute
+	state.pendingNextEdgeId = nil
+	state.heldUpSince = nil
+	state.laneDisciplineMoves = (state.laneDisciplineMoves or 0) + 1
+	local kinds = state.laneMoveKinds or {}
+	kinds[kind] = (kinds[kind] or 0) + 1
+	state.laneMoveKinds = kinds
+	state.nextLaneLook = _simClock + Discipline.SETTLE
+	local lastEdge = g:GetEdge(newRoute[#newRoute])
+	if lastEdge then state.finalDist = distAlongEdgeNearest(lastEdge, state.goalPos :: Vector3) end
+	bookRoute(state)
 end
 
 -- == Per-vehicle tick ==========================================================
@@ -2321,6 +2689,7 @@ local function updateDriver(state: DriverState, dt: number)
 		if not lcTarget then
 			state.laneChangeWait = 0
 			state.mergeHoldAt = nil
+			tryLaneDiscipline(g, state, edge)
 		elseif state.edgeDist >= lcEarliest then
 			local started, swapWith, tooShort = tryStartLaneChange(g, state, edge, lcTarget, lcLatest)
 			if tooShort then
@@ -2394,7 +2763,10 @@ local function updateDriver(state: DriverState, dt: number)
 	-- approach eases down so the car arrives at a speed it can actually hold
 	-- through the arc instead of whipping around the corner at road speed.
 	if state.connector then
-		if state.connSpeedCap then
+		-- A lane change is not a turn: its ribbon is laid out long enough for the car's speed
+		-- (laneChangeMinLength), so the car drifts over at the speed it had. Only the traffic
+		-- ahead may slow it.
+		if state.connSpeedCap and not laneChangeOf(state) then
 			targetSpeed = math.min(targetSpeed, state.connSpeedCap)
 		end
 	elseif edge and distToStop > -1 and distToStop < TURN_SLOW_ZONE then
@@ -2552,9 +2924,11 @@ local function updateDriver(state: DriverState, dt: number)
 		-- dead: it keeps its lane and re-plans, like a driver who missed the exit. On a city
 		-- street it holds for the gap, as a driver waiting to get into a turn lane does.
 		-- Once per lane edge, so a re-plan that still wants this move falls back to the hold.
-		local lcTarget, _, lcLatest = routeLaneChange(g, state, currentEdge)
+		local lcTarget, lcEarliest, lcLatest = routeLaneChange(g, state, currentEdge)
 		if lcTarget then
-			local holdAt = math.max(lcLatest, state.mergeHoldAt or 0, state.edgeDist)
+			-- Never before the window opens: a car held there would never be allowed to start.
+			local holdAt = math.max(lcLatest - laneChangeHoldBack(g, currentEdge, lcTarget), lcEarliest,
+				state.mergeHoldAt or 0, state.edgeDist)
 			local lcMove = math.min(remaining, holdAt - state.edgeDist)
 			state.edgeDist += lcMove
 			remaining -= lcMove

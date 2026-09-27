@@ -891,6 +891,15 @@ function TrafficSignalService.Init(roadService: any)
 	table.clear(_edgeSignalNode)
 	SignalPlanStore.Init(roadService)
 	TrafficLightPlacer.Init()
+	-- The player's lights on / off choice per junction (the Roads panel's Traffic Light card)
+	-- lives in the signal plans; every "does this junction have lights" question asks it.
+	RoadRules.setControlOverride(function(nodeId: number): RoadRules.NodeControl?
+		local plan = SignalPlanStore.rawPlan(nodeId)
+		if plan and plan.control ~= "auto" then
+			return plan.control :: RoadRules.NodeControl
+		end
+		return nil
+	end)
 end
 
 function TrafficSignalService.Bind()

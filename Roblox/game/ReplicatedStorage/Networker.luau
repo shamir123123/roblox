@@ -105,6 +105,9 @@ local Networker = {
 	-- list, the corridor list, and the full snapshot of one junction. Read-only and
 	-- polled only while the panel is open, exactly like RequestRoadTraffic.
 	RequestSignalData                   = RF("RequestSignalData"),
+	-- Client -> server: the Roads panel's Traffic Light card. Carries the clicked ground
+	-- point; the server finds the junction under it and turns its lights on or off.
+	RequestToggleJunctionLights         = RE("RequestToggleJunctionLights"),
 
 	ReportZoningActive           = RE("ReportZoningActive"),
 	-- Server -> client zone paint state: full snapshot on join, { id, zone } deltas on

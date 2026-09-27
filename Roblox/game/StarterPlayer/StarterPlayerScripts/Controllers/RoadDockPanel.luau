@@ -33,6 +33,8 @@ local DevelopmentTree = require(ReplicatedStorage.City.DevelopmentTree)
 -- bulldozing are the ones that already work rather than a second copy of all of it.
 local NatureCatalog = require(ReplicatedStorage.Nature.NatureCatalog)
 local Nature = require(script.Parent:WaitForChild("NaturePlacementController"))
+-- The Traffic tab's Traffic Light card: click a junction to put lights up or take them down.
+local JunctionLights = require(script.Parent:WaitForChild("JunctionLightTool"))
 
 local RoadDockPanel = {}
 
@@ -74,6 +76,12 @@ local _roadInfo: Frame? = nil
 local _rail: Frame? = nil
 local _parkKey: string? = nil
 local _parkActive = false
+-- Traffic tab state: its card grid, its info face, and whether the light tool is armed.
+local _trafficScroll: ScrollingFrame? = nil
+local _trafficInfo: Frame? = nil
+local _trafficStrokes: { [string]: UIStroke } = {}
+local _trafficActive = false
+local _trafficCard: string? = "TrafficLight"
 
 local function corner(parent: Instance, r: number)
 	local c = Instance.new("UICorner")
@@ -87,6 +95,8 @@ local TAB_DEFS = {
 	{ label = "One-Way", key = "One-Way" },
 	{ label = "Transit", key = "Transit" },
 	{ label = "Highway", key = "Highway" },
+	-- Junction control, not a road type: cards here act on junctions already built.
+	{ label = "Traffic", key = "Traffic" },
 	-- A car park is road infrastructure, not scenery, so it lives on the Roads page.
 	{ label = "Parking", key = "Parking" },
 }
@@ -782,6 +792,11 @@ local function buildRoadPage(dockObj: Dock.Dock, gui: ScreenGui)
 	pTitle.FontFace = Theme.Font.Bold
 	pTitle.Parent = parkInfo
 	_parkTitle = pTitle
+	local trafficInfo = parkInfo:Clone()
+	trafficInfo.Name = "TrafficInfo"
+	trafficInfo.Parent = page.Info
+	_trafficInfo = trafficInfo;
+	(trafficInfo:FindFirstChildOfClass("TextLabel") :: TextLabel).Text = "Traffic lights"
 
 	-- TEMPLATE, bottom-right: the street preview and its dimensions, hard right on
 	-- the same line the tabs start from on the left. This whole cluster used to be
@@ -1046,6 +1061,31 @@ local function setParkingMode(on: boolean)
 	end
 end
 
+-- The Traffic tab, like Parking, takes the click away from road drawing: with the Traffic
+-- Light card picked, a click on a junction flips its lights instead of starting a road.
+local function setSelectedTrafficCard(key: string?)
+	_trafficCard = key
+	for k, stroke in _trafficStrokes do
+		stroke.Color = if k == key then Theme.Color.Accent else Theme.Color.StrokeSoft
+		stroke.Thickness = if k == key then Theme.StrokeWidth.Thick else Theme.StrokeWidth.Thin
+	end
+	JunctionLights.setEnabled(_trafficActive and key == "TrafficLight")
+end
+
+local function setTrafficMode(on: boolean)
+	if _trafficActive == on then return end
+	_trafficActive = on
+	if on then
+		deselectRoad()
+		if _road and _road.setEnabled then _road.setEnabled(false) end
+		setSelectedTrafficCard(_trafficCard)
+	else
+		JunctionLights.setEnabled(false)
+		if _road and _road.setEnabled then _road.setEnabled(true) end
+		applyConfig()
+	end
+end
+
 local function showRoadDock(visible: boolean)
 	local dock = _dock
 	if not dock then return end
@@ -1070,15 +1110,24 @@ setTabActive = function(key: string)
 		scroll.CanvasPosition = Vector2.zero
 	end
 	local park = key == "Parking"
-	-- The two card grids share the content frame, so exactly one is ever up: leaving the
-	-- (empty) road grid on top would swallow the wheel that pages the parking cards.
-	if scroll then scroll.Visible = not park end
+	local traffic = key == "Traffic"
+	local roads = not park and not traffic
+	-- The card grids share the content frame, so exactly one is ever up: leaving the
+	-- (empty) road grid on top would swallow the wheel that pages the other cards.
+	if scroll then scroll.Visible = roads end
 	if _parkScroll then _parkScroll.Visible = park end
-	if _roadInfo then _roadInfo.Visible = not park end
+	if _trafficScroll then _trafficScroll.Visible = traffic end
+	if _roadInfo then _roadInfo.Visible = roads end
 	if _parkInfo then _parkInfo.Visible = park end
-	-- The rail is the road draw-mode column; none of it applies to dropping a car park.
-	if _rail then _rail.Visible = not park end
-	setParkingMode(park)
+	if _trafficInfo then _trafficInfo.Visible = traffic end
+	-- The rail is the road draw-mode column; none of it applies to a car park or a junction.
+	if _rail then _rail.Visible = roads end
+	-- Leave one tool before arming the next, so road drawing is never switched back on
+	-- between them.
+	if not park then setParkingMode(false) end
+	if not traffic then setTrafficMode(false) end
+	if park then setParkingMode(true) end
+	if traffic then setTrafficMode(true) end
 end
 
 local function buildParkingContent(parent: Instance)
@@ -1114,6 +1163,44 @@ local function buildParkingContent(parent: Instance)
 	end
 end
 
+-- Card art: a three-lamp signal head.
+local function buildSignalPreview(container: Frame)
+	local head = Instance.new("Frame")
+	head.AnchorPoint = Vector2.new(0.5, 0)
+	head.Position = UDim2.new(0.5, 0, 0, 5)
+	head.Size = UDim2.new(0, 22, 1, -32)
+	head.BackgroundColor3 = Color3.fromRGB(34, 36, 40)
+	head.BorderSizePixel = 0
+	head.Parent = container
+	corner(head, 4)
+	for i, col in { Color3.fromRGB(230, 70, 60), Color3.fromRGB(240, 190, 60), Color3.fromRGB(80, 210, 110) } do
+		local lamp = Instance.new("Frame")
+		lamp.AnchorPoint = Vector2.new(0.5, 0.5)
+		lamp.Position = UDim2.fromScale(0.5, (i - 0.5) / 3)
+		lamp.Size = UDim2.fromOffset(12, 12)
+		lamp.BackgroundColor3 = col
+		lamp.BorderSizePixel = 0
+		lamp.Parent = head
+		corner(lamp, 6)
+	end
+end
+
+local function buildTrafficContent(parent: Instance)
+	local scroll = BuildCard.grid(parent)
+	scroll.Name = "TrafficCards"
+	scroll.Visible = false
+	_trafficScroll = scroll
+	local card, preview, stroke = BuildCard.shell("TrafficLight", 1)
+	buildSignalPreview(preview)
+	local btn = BuildCard.footer(card, "Traffic Light")
+	card.Parent = scroll
+	_trafficStrokes.TrafficLight = stroke
+	Tooltip.attach(card, "Click a junction to add traffic lights, or to remove them if it has some")
+	btn.Activated:Connect(function()
+		setSelectedTrafficCard(if _trafficCard == "TrafficLight" then nil else "TrafficLight")
+	end)
+end
+
 local function buildRoadsContent(parent: Instance)
 	_roadsScroll = BuildCard.grid(parent)
 	local scroll = _roadsScroll :: ScrollingFrame
@@ -1144,6 +1231,7 @@ function RoadDockPanel.Init(props: InitProps)
 	buildRoadPage(props.dock, props.gui)
 	buildRoadsContent(_roadCardsRegion :: Frame)
 	buildParkingContent(_roadCardsRegion :: Frame)
+	buildTrafficContent(_roadCardsRegion :: Frame)
 	setTabActive(TAB_DEFS[1].key)
 end
 
@@ -1164,6 +1252,12 @@ function RoadDockPanel.Activate()
 		setSelectedLot(_parkKey or LOT_KEYS[1])
 		return
 	end
+	if _trafficActive then
+		if _road and _road.setEnabled then _road.setEnabled(false) end
+		deselectRoad()
+		setSelectedTrafficCard(_trafficCard)
+		return
+	end
 	applyConfig()
 end
 
@@ -1175,6 +1269,7 @@ function RoadDockPanel.Deactivate()
 	-- Closing the section takes the car-park tool with it. The tab itself stays put, so
 	-- re-opening Roads arms it again through Activate.
 	Nature.setEnabled(false)
+	JunctionLights.setEnabled(false)
 end
 
 -- RoadPlacementController changed state: resync the rail's selected/toggle look.

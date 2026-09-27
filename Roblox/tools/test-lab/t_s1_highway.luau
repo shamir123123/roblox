@@ -16,6 +16,7 @@ local rng = w.Studio.Random.new(seed)
 local lanes = {}
 for _, e in w.graph:GetEdges() do if e.segmentId == w.graph:GetEdges()[1].segmentId then table.insert(lanes, e.points[1].X) end end
 local t, nextSpawn, spawned = 0, 0, 0
+local lastArrived, lastArrivalAt = -1, 0
 while t < 150 do
 	if t >= nextSpawn and spawned < 140 then
 		local x0 = lanes[rng:NextInteger(1, #lanes)]
@@ -29,6 +30,27 @@ while t < 150 do
 	end
 	w:step(1 / 30)
 	Metrics.tick(m)
+	-- jam watch (verbose runs): no arrival for 30 s once traffic is flowing -> dump and stop
+	if process.args[3] == "v" and math.floor(t * 30) % 30 == 0 then
+		local a = Metrics.summary(m).arrived
+		if a ~= lastArrived then lastArrived = a; lastArrivalAt = t end
+		if t > 40 and t - lastArrivalAt > 30 then
+			print(("JAM at t=%.0f (no arrival since %.0f)"):format(t, lastArrivalAt))
+			for _, rec in w.cars do
+				local st = w:state(rec.model)
+				if st then
+					local p = st.smoothCFrame and st.smoothCFrame.Position
+					local lc = st.laneChange
+					print(("  %s at %s spd %.1f edge %s@%.1f conn %s next %s pend %s reason %s blockedBy %s merge %s holdAt %s lc %s")
+						:format(rec.model.Name, p and ("%.0f,%.0f"):format(p.X, p.Z) or "?", st.currentSpeed or 0, tostring(st.edgeId), st.edgeDist or 0,
+							tostring(st.connector ~= nil), tostring(st.nextEdgeId), tostring(st.pendingNextEdgeId), tostring(st.stopReason),
+							st.blockedBy and st.blockedBy.Name or "-", tostring(st.mergeInto), tostring(st.mergeHoldAt),
+							lc and ("%s->%s %.0f..%.0f"):format(tostring(lc.from), tostring(lc.to), lc.d0 or -1, lc.d1 or -1) or "-"))
+				end
+			end
+			break
+		end
+	end
 	if math.floor(t * 30) % 6 == 0 then Metrics.overlaps(m) end
 	t += 1 / 30
 end

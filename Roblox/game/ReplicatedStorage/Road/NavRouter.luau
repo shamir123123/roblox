@@ -373,7 +373,10 @@ end
 -- `allowCrossing` (the old preferTowardGoal slot) lets the trip start or end across the
 -- centre line. `vehicleClass` (default Car) gates which lanes the search may use; `profile`
 -- (DriverProfile) is the driver's own mind -- buses/trains/emergency pass none.
-function NavRouter.findPath(graph: any, startPos: Vector3, goalPos: Vector3, allowCrossing: boolean?, vehicleClass: string?, profile: Profile?): ({ Vector3 }?, { string }?)
+-- `startLane` pins the start to one lane at a known distance along it: a driver already on
+-- the road asking "if I moved over into THIS lane, how would I go on from there?"
+export type StartLane = { edgeId: string, dist: number }
+function NavRouter.findPath(graph: any, startPos: Vector3, goalPos: Vector3, allowCrossing: boolean?, vehicleClass: string?, profile: Profile?, startLane: StartLane?): ({ Vector3 }?, { string }?)
 	local class = vehicleClass or "Car"
 	local function allows(edge: any): boolean
 		local set = edge.allowedVehicles
@@ -385,6 +388,21 @@ function NavRouter.findPath(graph: any, startPos: Vector3, goalPos: Vector3, all
 		return nil, nil
 	end
 	local starts = endpointsNear(graph, startNearest, startPos, allowCrossing == true, allows)
+	if startLane then
+		local lane = graph._edges[startLane.edgeId]
+		if not lane or not allows(lane) then
+			return nil, nil
+		end
+		local dist = math.clamp(startLane.dist, 0, lane.length)
+		local index = #lane.points
+		for i, d in lane._cum or {} do
+			if d >= dist then
+				index = i
+				break
+			end
+		end
+		starts = { { edge = lane, index = index, dist = dist, extra = 0 } }
+	end
 	local goals: { [string]: Endpoint } = {}
 	for _, goal in endpointsNear(graph, goalNearest, goalPos, allowCrossing == true, allows) do
 		goals[goal.edge.id] = goal

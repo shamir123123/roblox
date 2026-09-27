@@ -9,6 +9,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local NetMiddleware = require(ReplicatedStorage.NetMiddleware)
+local RoadRules = require(ReplicatedStorage.Road.RoadRules)
 local SignalSpec = require(ReplicatedStorage.Road.SignalSpec)
 local SignalPlanStore = require(script.Parent.SignalPlanStore)
 local SignalCoordinator = require(script.Parent.SignalCoordinator)
@@ -26,6 +27,10 @@ local _roadService: any = nil
 local _setPlanRemote: RemoteEvent
 local _groupEditRemote: RemoteEvent
 local _dataRemote: RemoteFunction
+local _toggleLightsRemote: RemoteEvent
+
+-- How far from a junction's centre a Traffic Light click still means that junction.
+local TOGGLE_PICK_RADIUS = 40
 
 -- ---------------------------------------------------------------- helpers --
 
@@ -83,6 +88,37 @@ local function onSetPlan(player: Player, rawNodeId: any, rawPlan: any)
 	end
 
 	SignalPlanStore.setPlan(nodeId, plan)
+end
+
+-- The Roads panel's Traffic Light card: lights up at a junction that has none, down at one
+-- that has them. Stored as the junction's control choice ("auto" when the flip lands back on
+-- what the road hierarchy would pick anyway), so it is saved with the city and survives a
+-- reload, and the signal service rebuilds the junction off the store's change notice.
+local function onToggleLights(player: Player, rawPos: any)
+	if not canEdit(player) then return end
+	if not NetMiddleware.CheckServerRate(_toggleLightsRemote, player) then return end
+	if typeof(rawPos) ~= "Vector3" or rawPos.X ~= rawPos.X or rawPos.Z ~= rawPos.Z then return end
+	local network = _roadService and _roadService.getNetwork()
+	if not network then return end
+
+	local best: number? = nil
+	local bestSq = TOGGLE_PICK_RADIUS * TOGGLE_PICK_RADIUS
+	for nodeId, node in network:getNodes() do
+		if not node.segments or #node.segments < 3 then continue end
+		local dx, dz = node.position.X - rawPos.X, node.position.Z - rawPos.Z
+		local d2 = dx * dx + dz * dz
+		if d2 < bestSq then
+			bestSq = d2
+			best = nodeId
+		end
+	end
+	if not best then return end
+
+	local current = RoadRules.nodeControl(network, best)
+	if current == "none" then return end -- a roundabout mouth: always give-way
+	local want: SignalSpec.ControlMode = if current == "signal" then "priority" else "signal"
+	local auto = RoadRules.autoNodeControl(network, best)
+	SignalPlanStore.setControl(best, if want == auto then "auto" else want)
 end
 
 local function onGroupEdit(player: Player, req: any)
@@ -233,11 +269,13 @@ function SignalReplicationService.Init(signalService: any, roadService: any)
 	_setPlanRemote = Net.RequestSetSignalPlan
 	_groupEditRemote = Net.RequestSignalGroupEdit
 	_dataRemote = Net.RequestSignalData
+	_toggleLightsRemote = Net.RequestToggleJunctionLights
 end
 
 function SignalReplicationService.Bind()
 	NetMiddleware.RegisterServerRateLimit(_setPlanRemote, EDIT_COOLDOWN)
 	NetMiddleware.RegisterServerRateLimit(_groupEditRemote, EDIT_COOLDOWN)
+	NetMiddleware.RegisterServerRateLimit(_toggleLightsRemote, EDIT_COOLDOWN)
 	-- RemoteFunction: the middleware keys off the instance, so the RemoteEvent type on
 	-- its signature is the only thing in the way (same cast RoadReplicationService uses
 	-- for its traffic query).
@@ -246,6 +284,7 @@ function SignalReplicationService.Bind()
 	_setPlanRemote.OnServerEvent:Connect(onSetPlan)
 	_groupEditRemote.OnServerEvent:Connect(onGroupEdit)
 	_dataRemote.OnServerInvoke = onData
+	_toggleLightsRemote.OnServerEvent:Connect(onToggleLights)
 end
 
 return SignalReplicationService

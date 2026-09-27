@@ -605,8 +605,16 @@ end
 -- (median, far carriageway and lane lines untouched) and only the ramp is trimmed, back to
 -- where it clears the highway's edge. Returns the ramp's and the host arm's segment ids.
 local STRAIGHT_THROUGH_DOT = -math.cos(math.rad(RoadConstants.STRAIGHT_JOIN_TOLERANCE_DEG))
-local function mergeBranch(arms: { IntersectionRenderer.Arm }, segIds: { Types.SegmentId }): (Types.SegmentId?, Types.SegmentId?)
+local function mergeBranch(arms: { IntersectionRenderer.Arm }, segIds: { Types.SegmentId }, nodeId: Types.NodeId?): (Types.SegmentId?, Types.SegmentId?)
 	if #arms ~= 3 then return nil, nil end
+	-- A street or steep ramp joining a DIVIDED highway from one side is right-in/right-out
+	-- (RoadRules.highwayJunction): the highway, median and all, runs straight past it exactly
+	-- as it does past a shallow ramp, instead of a junction box cutting the median open.
+	local oneSidedDivided = false
+	if nodeId then
+		local kind, divided = RoadRules.highwayJunction(_network, nodeId)
+		oneSidedDivided = kind == "onesided" and divided
+	end
 	-- Every pairing is tried: a ramp drawn in tangent to the highway is ALSO straight against
 	-- the far highway arm, and that pair must not hide the real one.
 	for k = 1, 3 do
@@ -618,7 +626,7 @@ local function mergeBranch(arms: { IntersectionRenderer.Arm }, segIds: { Types.S
 			continue
 		end
 		local di, dj = arms[k].dir:Dot(arms[i].dir), arms[k].dir:Dot(arms[j].dir)
-		if math.max(di, dj) >= MERGE_FORK_COS_MIN then
+		if math.max(di, dj) >= MERGE_FORK_COS_MIN or oneSidedDivided then
 			return segIds[k], if di >= dj then segIds[i] else segIds[j]
 		end
 	end
@@ -655,7 +663,8 @@ end
 
 -- Trim at a merge node: the ramp's clear distance, 0 for the highway running through.
 local function mergeTrim(nodeId: Types.NodeId, segId: Types.SegmentId): number
-	local branchId, hostId = mergeBranch(armsAndSegsForNode(nodeId))
+	local arms, segIds = armsAndSegsForNode(nodeId)
+	local branchId, hostId = mergeBranch(arms, segIds, nodeId)
 	if branchId ~= segId or not hostId then return 0 end
 	local branch, host = _network:getSegment(branchId), _network:getSegment(hostId)
 	if not branch or not host then return 0 end
@@ -671,7 +680,7 @@ local function nodeStyle(nodeId: Types.NodeId): string
 	local arms, segIds = armsAndSegsForNode(nodeId)
 	local deg = #arms
 	if deg >= 3 then
-		return if mergeBranch(arms, segIds) then "merge" else "intersection"
+		return if mergeBranch(arms, segIds, nodeId) then "merge" else "intersection"
 	end
 	if deg <= 1 then
 
@@ -2360,7 +2369,7 @@ local function refreshNode(nodeId: Types.NodeId)
 	local arms, segIds = armsAndSegsForNode(nodeId)
 
 	if style == "merge" then
-		local branchId, hostId = mergeBranch(arms, segIds)
+		local branchId, hostId = mergeBranch(arms, segIds, nodeId)
 		local branch = branchId and _network:getSegment(branchId)
 		local host = hostId and _network:getSegment(hostId)
 		if not branch or not host then return end

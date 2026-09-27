@@ -84,6 +84,15 @@ def main():
         for t in json.load(open(tracks_file)):
             x, y = (t[0]-cx+half)*ppu, (t[1]-cz+half)*ppu
             dr.point((x, y), fill=(255, 140, 0, 255))
+    signs_file = sys.argv[1].replace('.json', '.signs.json')
+    if os.path.exists(signs_file):
+        col = {'stop': (230, 30, 30), 'allway': (255, 120, 120), 'yield': (255, 255, 255), 'oneway': (20, 20, 20),
+               'noentry': (255, 0, 160), 'highway': (0, 170, 60), 'speed': (60, 160, 255)}
+        for sg in json.load(open(signs_file)):
+            x, y = (sg['x']-cx+half)*ppu, (sg['z']-cz+half)*ppu
+            c = col.get(sg['kind'], (255, 255, 0))
+            dr.line((x, y, x + sg['fx']*5*ppu, y + sg['fz']*5*ppu), fill=c + (255,), width=2)
+            dr.rectangle((x-3, y-3, x+3, y+3), fill=c + (255,), outline=(255, 255, 0, 255))
     img.save(out)
     print(f"{len(items)} parts drawn -> {out}")
 

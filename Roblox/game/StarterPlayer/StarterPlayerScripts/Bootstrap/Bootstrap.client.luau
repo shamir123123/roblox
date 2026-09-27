@@ -176,6 +176,10 @@ if not okSignalTool then warn("[Bootstrap] SignalToolView failed to start") end
 local okStreetNames = pcall(function() require(world:WaitForChild("StreetNameView")).Start() end)
 if not okStreetNames then warn("[Bootstrap] StreetNameView failed to start") end
 
+-- Traffic signs (stop / give way / one way / do not enter / highway entrance / speed),
+-- planned from the road network and drawn near the camera only.
+protect("TrafficSignView", function() require(world:WaitForChild("TrafficSignView")).Start() end)
+
 local NPCDriverView = require(world:WaitForChild("NPCDriverView"))
 protect("NPCDriverView", function() NPCDriverView.Start() end)
 

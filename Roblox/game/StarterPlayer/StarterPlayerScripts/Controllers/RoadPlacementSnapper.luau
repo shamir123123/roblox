@@ -12,6 +12,7 @@ local Workspace = game:GetService("Workspace")
 local RoadConstants   = require(ReplicatedStorage.Road.RoadConstants)
 local SnapConstants   = require(ReplicatedStorage.Road.SnapUtil.SnapConstants)
 local RoadTypeCatalog = require(ReplicatedStorage.Road.RoadTypeCatalog)
+local RoadRules       = require(ReplicatedStorage.Road.RoadRules)
 local BezierUtil      = require(ReplicatedStorage.Road.BezierUtil)
 local IntersectionRenderer = require(ReplicatedStorage.Road.IntersectionRenderer)
 local ApproachBend    = require(ReplicatedStorage.Road.ApproachBend)
@@ -649,15 +650,23 @@ local function applyHighwayMerge(p0: Vector3?, p1: Vector3?, p2: Vector3?, p3: V
 	if approach.Magnitude < 1e-3 then approach = Vector3.new(p3.X - p0.X, 0, p3.Z - p0.Z) end
 	if approach.Magnitude < 1e-3 then return p0, p1, p2, p3 end
 	approach = approach.Unit
-	-- One-way host: always merge downstream (one-way travel runs p0->p3). Two-way
-	-- host: whichever direction needs the smaller bend from the approach.
-	if not hostSpec.oneWay and approach:Dot(hd) < 0 then
+	-- One-way host: always merge downstream (one-way travel runs p0->p3). Divided host: into
+	-- the carriageway on the ramp's OWN side -- the other one is across the median, and the
+	-- junction is right-in/right-out, so a ramp aimed at it would lead nowhere. Other
+	-- two-way host: whichever direction needs the smaller bend from the approach.
+	local perp = approach - hd * approach:Dot(hd)
+	if hostSpec.median and not hostSpec.oneWay and perp.Magnitude > 1e-3 then
+		-- A direction's lanes lie on laneSide * (travel x up); the ramp comes in from -perp.
+		local ownSide = hd:Cross(Vector3.yAxis) * RoadRules.getLaneSideSign()
+		if ownSide:Dot(-perp) < 0 then
+			hd = -hd
+		end
+	elseif not hostSpec.oneWay and approach:Dot(hd) < 0 then
 		hd = -hd
 	end
 	-- Keep a hint of the approach side so the ramp leans into the carriageway like a
 	-- real gore instead of kissing it dead-parallel.
 	local a = SnapConstants.MERGE_JOIN_ANGLE_RAD
-	local perp = approach - hd * approach:Dot(hd)
 	local endDir = if perp.Magnitude > 1e-3
 		then (hd * math.cos(a) + perp.Unit * math.sin(a)).Unit
 		else hd

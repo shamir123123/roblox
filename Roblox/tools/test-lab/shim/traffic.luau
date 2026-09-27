@@ -7,7 +7,7 @@ function World.new(mode: string, opts: any?)
 	opts = opts or {}
 	local Studio = require("./setup")(mode)
 	Studio.expose("ServerScriptService.Services.NPC.NPCDriverService",
-		"NPCDriverService.__test = { queueLeader = getNearestQueueLeader, drivers = _drivers, edgeIndex = _edgeDriverIndex, laneChangeIndex = _laneChangeIndex, connIndex = _connectorByNextEdgeIndex, owesCourtesy = owesCourtesy, claimant = junctionClaimant, canEnter = canEnterIntersection, exitLaneHasRoom = exitLaneHasRoom, distToStopLine = distToStopLine, boxHasConflict = boxHasConflict }")
+		"NPCDriverService.__test = { queueLeader = getNearestQueueLeader, drivers = _drivers, edgeIndex = _edgeDriverIndex, laneChangeIndex = _laneChangeIndex, connIndex = _connectorByNextEdgeIndex, owesCourtesy = owesCourtesy, claimant = junctionClaimant, canEnter = canEnterIntersection, exitLaneHasRoom = exitLaneHasRoom, distToStopLine = distToStopLine, boxHasConflict = boxHasConflict, ringOf = ringOf, ringHasRoom = ringHasRoom }")
 	Studio.expose("ServerScriptService.Services.Util.PathFollower",
 		"PathFollower.__test = { registry = _carRegistry, spatial = _spatial, poseOf = _poseOf, movedAt = _movedAt, npcIds = _npcIds, modelOfId = _modelOfId, lastSentTo = _lastSentTo, inRange = _inRange, prox = _proximityAccum, carHalf = _carHalf }")
 	local self = setmetatable({}, World)

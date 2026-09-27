@@ -88,6 +88,23 @@ for _, rec in w.cars do
 end
 if process.args[8] == "stuck" then
 	local D = w.Drivers.__test
+	if D.ringOf then
+		local seen = {}
+		for _, e in w.graph:GetEdges() do
+			if e.isRoundabout then
+				local ring = D.ringOf(w.graph, e)
+				if not seen[ring] then
+					seen[ring] = true
+					local len, onRing = 0, 0
+					for _, id in ring.edges do
+						len += w.graph:GetEdge(id).length
+						for _, o in D.edgeIndex[id] or {} do if o.edgeId == id then onRing += 1 end end
+					end
+					print(("RING lanes %d length %.0f capacity %d on ring %d room %s"):format(#ring.edges, len, ring.capacity, onRing, tostring(D.ringHasRoom(w.graph, e))))
+				end
+			end
+		end
+	end
 	for _, rec in w.cars do
 		local st = w:state(rec.model)
 		if st and (st.stuckTime or 0) + (st.connBlockedTime or 0) > 5 or (st and (st.currentSpeed or 0) < 0.5 and not rec.arrived) then

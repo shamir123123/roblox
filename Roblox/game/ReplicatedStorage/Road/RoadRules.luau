@@ -198,9 +198,12 @@ end
 
 -- Functional class. Drives which intersections get signals vs priority rules,
 -- and how strongly trucks prefer a road. Avenues/boulevards and wider are
--- arterial; ordinary streets and alleys are local.
+-- arterial; ordinary streets and alleys are local. Strictly WIDER than a two-lane
+-- street (36 authored): at ">=" the plain street itself counted as arterial, so every
+-- street junction read as two major roads meeting.
+local ARTERIAL_MIN_WIDTH = 36 * RoadConstants.WORLD_SCALE
 function RoadRules.roadClass(spec: RoadTypeSpec): RoadClass
-	if spec.laneCount >= 3 or spec.width >= 36 * RoadConstants.WORLD_SCALE then
+	if spec.laneCount >= 3 or spec.width > ARTERIAL_MIN_WIDTH + 1e-3 then
 		return "arterial"
 	end
 	return "local"
@@ -212,11 +215,84 @@ end
 
 export type NodeControl = "none" | "priority" | "signal"
 
+-- Flat unit direction a segment leaves `nodeId` in, from its control points.
+local function armDirAt(seg: any, nodeId: number): Vector3?
+	local raw: Vector3
+	if seg.startNode == nodeId then
+		raw = seg.p1 - seg.p0
+		if raw.Magnitude < 1e-3 then raw = seg.p3 - seg.p0 end
+	else
+		raw = seg.p2 - seg.p3
+		if raw.Magnitude < 1e-3 then raw = seg.p0 - seg.p3 end
+	end
+	local flat = Vector3.new(raw.X, 0, raw.Z)
+	return if flat.Magnitude > 1e-3 then flat.Unit else nil
+end
+
+-- Two arms this close to opposite run straight through the node (the renderer's own test).
+local THROUGH_DOT = -0.866
+
+export type HighwayJunction = "onesided" | "crossing"
+
+-- How a junction sits on a highway that runs straight through it:
+--   "onesided" -- every other arm joins from ONE side: an on/off ramp, a slip road, a street
+--                 T-ing into it. Traffic merges and diverges; nothing crosses the highway.
+--                 No lights, and on a divided highway the median runs straight past
+--                 (right-in/right-out: nobody turns across it).
+--   "crossing" -- arms on BOTH sides: a road drawn right across the highway. The median
+--                 opens there and the junction is signalised.
+--   nil        -- no highway runs straight through this node.
+-- Second return: whether that highway is DIVIDED (a two-way road with a median).
+function RoadRules.highwayJunction(network: any, nodeId: number): (HighwayJunction?, boolean)
+	local node = network:getNodes()[nodeId]
+	local segIds = if node then node.segments else nil
+	if not segIds or #segIds < 3 then return nil, false end
+	local dirs: { Vector3 } = {}
+	local specs: { any } = {}
+	for i, sid in segIds do
+		local seg = network:getSegment(sid)
+		local dir = seg and armDirAt(seg, nodeId)
+		if not dir then return nil, false end
+		dirs[i] = dir
+		specs[i] = RoadTypeCatalog.getOrDefault(seg.roadType)
+	end
+	local found: HighwayJunction? = nil
+	local divided = false
+	for a = 1, #dirs do
+		for b = a + 1, #dirs do
+			if not (specs[a].isHighway and specs[b].isHighway) or dirs[a]:Dot(dirs[b]) >= THROUGH_DOT then continue end
+			local left, right = false, false
+			for k = 1, #dirs do
+				if k == a or k == b then continue end
+				local side = dirs[a]:Cross(dirs[k]).Y
+				if side > 0 then left = true else right = true end
+			end
+			local kind: HighwayJunction = if left and right then "crossing" else "onesided"
+			-- A crossing anywhere at the node wins: two highways meeting at grade still cross.
+			if kind == "crossing" or not found then
+				found = kind
+				divided = specs[a].median == true and not specs[a].oneWay
+			end
+		end
+	end
+	return found, divided
+end
+
+-- The player's per-junction choice (lights on / off), installed by the server's signal
+-- service; nil everywhere else, which leaves every junction on the automatic rule.
+local _controlOverride: ((nodeId: number) -> NodeControl?)? = nil
+function RoadRules.setControlOverride(fn: ((nodeId: number) -> NodeControl?)?)
+	_controlOverride = fn
+end
+
 -- How an intersection node is controlled. Not every junction gets lights:
---   * < 3 arms      -> "none"     (a continuation / dead end, no conflict)
---   * 4+ arms       -> "signal"   (busy, and uncontrolled 4-ways deadlock NPCs)
---   * 3 arms (a T)  -> "priority" (through road has right-of-way, the stem yields)
---                      unless every arm is arterial (a major Y), which signals.
+--   * < 3 arms                         -> "none"     (a continuation / dead end)
+--   * a roundabout node                -> "none"     (entering traffic gives way)
+--   * a highway ramp / slip / side road -> "priority" (see highwayJunction)
+--   * a road drawn across a highway    -> "signal"
+--   * two different major roads meet   -> "signal"
+--   * anything else                    -> "priority" (smaller roads give way to the major
+--                                                     one, equal roads take turns)
 -- `network` is the live RoadNetwork (typed loosely since it crosses the module
 -- boundary as an injected runtime object).
 function RoadRules.nodeControl(network: any, nodeId: number): NodeControl
@@ -230,34 +306,66 @@ function RoadRules.nodeControl(network: any, nodeId: number): NodeControl
 	if network.isRoundaboutNode ~= nil and network:isRoundaboutNode(nodeId) then
 		return "none"
 	end
-	-- Signals only where a MAJOR road meets: any arm of 4+ lanes. Smaller junctions (2-lane
-	-- crossings, ordinary Ts) use a give-way priority rule so quiet streets aren't cluttered
-	-- with lights. Per-intersection manual overrides still apply on top of this default.
+	local forced = if _controlOverride then _controlOverride(nodeId) else nil
+	if forced == "signal" or forced == "priority" then
+		return forced
+	end
+	return RoadRules.autoNodeControl(network, nodeId)
+end
+
+-- The automatic rule alone, ignoring the player's override. Only for junctions nodeControl
+-- has already found to be one (3+ arms, not a roundabout).
+function RoadRules.autoNodeControl(network: any, nodeId: number): NodeControl
+	local node = network:getNodes()[nodeId]
+	-- A highway running through: lights only where a road crosses it. A ramp, a slip road or
+	-- a street joining from one side merges under give-way, whatever its lane count.
+	local hwKind = RoadRules.highwayJunction(network, nodeId)
+	if hwKind == "onesided" then
+		return "priority"
+	elseif hwKind == "crossing" then
+		return "signal"
+	end
 	local segs = if node then node.segments else nil
-	if segs then
-		-- A junction where ONLY highways meet never signals: ramps merge and highways
-		-- cross under give-way priority (the through carriageway has right-of-way),
-		-- like a motorway interchange. Any non-highway arm falls through to the
-		-- normal signal rules below.
-		local allHighway = #segs > 0
-		for _, sid in segs :: { number } do
-			local s = network:getSegments()[sid]
-			if not (s and RoadTypeCatalog.getOrDefault(s.roadType).isHighway) then
-				allHighway = false
-				break
-			end
-		end
-		if allHighway then
-			return "priority"
-		end
-		for _, sid in segs :: { number } do
-			local s = network:getSegments()[sid]
-			if s and (RoadTypeCatalog.getOrDefault(s.roadType).laneCount or 2) >= 4 then
-				return "signal"
-			end
+	if not segs then
+		return "priority"
+	end
+	-- A junction where ONLY highways meet never signals: ramps merge and highways fork
+	-- under give-way priority, like a motorway interchange.
+	local allHighway = #segs > 0
+	for _, sid in segs :: { number } do
+		local s = network:getSegments()[sid]
+		if not (s and RoadTypeCatalog.getOrDefault(s.roadType).isHighway) then
+			allHighway = false
+			break
 		end
 	end
-	return "priority"
+	if allHighway then
+		return "priority"
+	end
+	-- Road hierarchy. Lights only where two DIFFERENT major roads meet (arterial class: 3+
+	-- lanes or a wide carriageway -- the same test the drivers' give-way priority uses). A
+	-- major road that simply runs through, with smaller roads joining it from either side,
+	-- gets no lights: the smaller roads give way to it. A car that has waited long enough
+	-- takes its turn and the main road lets it in (NPCDriverService), then the next one does
+	-- the same -- so a side road that cannot cope queues visibly, and the fix is the player's:
+	-- lights (a per-junction override), a roundabout, or another way round. This used to
+	-- signalise any junction with a 4-lane arm, so a one-way lane joining an avenue got a full
+	-- set of lights.
+	local majorDirs: { Vector3 } = {}
+	for _, sid in segs :: { number } do
+		local s = network:getSegment(sid)
+		if s and RoadRules.roadClass(RoadTypeCatalog.getOrDefault(s.roadType)) == "arterial" then
+			local dir = armDirAt(s, nodeId)
+			if dir then table.insert(majorDirs, dir) end
+		end
+	end
+	if #majorDirs <= 1 then
+		return "priority"
+	end
+	if #majorDirs == 2 and majorDirs[1]:Dot(majorDirs[2]) < THROUGH_DOT then
+		return "priority" -- one major road running straight through
+	end
+	return "signal"
 end
 
 -- Roundabout right-of-way. No roundabout geometry exists yet -- this records the

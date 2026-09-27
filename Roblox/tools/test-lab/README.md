@@ -27,6 +27,14 @@ test every change before it ships.
 | `t_s4_leak.luau <mode>` | 1500 trips, then every driver/index/table must be empty |
 | `t_s5_giveway.luau <mode> <cross\|tee\|cross-heavy> <seed> <seconds>` | junctions without lights: fairness, starvation |
 | `t_s6_roundabout.luau <mode> <small\|medium\|large> <seed> <seconds> <cars/min/arm>` | traffic through a real RoadService roundabout |
+| `t_s7_edge.luau <mode> <seconds> <seed>` | map-edge outside connections: both lanes used to the edge, no late merges, nothing stuck |
+| `t_s8_stream.luau <mode> <seconds> <seed> [viewer distance]` | the pose stream a far viewer receives: stop lag, cars drawn inside each other, farewells |
+| `t_perf.luau <mode> <cars> <seconds> [grid N] [far]` | traffic tick cost at city scale (ms per tick), and why cars are standing still |
+| `t_s9_hwyjunction.luau <mode> <seconds> <seed>` | divided highways: right-in/right-out ramps, no median crossings, far side never waits |
+| `t_s10_lanes.luau <mode> <seconds> <seed>` | highway lane discipline: lane share, yields to faster cars behind, faster cars held up, braked lane changes |
+| `t_lights_toggle.luau` | junction control by road hierarchy, and the Traffic Light card: add / remove lights, survives save + load |
+| `t_signs.luau` | traffic sign plan (USA + Europe) on real junctions: which signs, off the carriageway, facing their traffic |
+| `reg.sh <mode> <outdir>` | the whole traffic suite above, 4 at a time (needs `CITY_LAB_PLACE`; `CITY_LAB_GAME` to test a frozen copy) |
 | `render_lab.luau <mode> <scene> <out.json>` then `python3 render/top.py out.json out.png cx cz half ppu` | top-down picture of what the road code builds |
 | `specrun.luau <mode>` | the project's own `.spec` modules |
 | `zone_lab.luau <mode> <street\|streethill\|corner\|cornerhill> <out.json>` | zones a street (flat or 1-in-8 hill, straight or with a 90-degree bend) with the real Plot/Building/LotDressing services and the place's templates, waits for construction, then measures how far each lot's ground sits above or below its floor. `ROWS=1` lists every lot, `DIAG=1` dumps the worst lot's ground and terrain-ledger owners |
