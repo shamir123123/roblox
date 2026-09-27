@@ -351,6 +351,12 @@ local Pipe = {
 	REGISTER_TIMEOUT = 180, -- limbo watchdog: family moves in even if the drive dies
 	MAX_ARRIVALS_PER_STEP = 4, -- full-demand move-in budget (free entrances self-limit)
 	entries = {} :: { { car: Model, spawn: Vector3, at: number } },
+	-- Per sim step (LOD.step): spawn points already found occupied -- nothing moves while a
+	-- step runs, so one look is enough for every empty home it tries -- and the step in
+	-- which every entrance was found busy (then no other home can be served either).
+	blocked = {} :: { [Vector3]: boolean },
+	blockedStep = -1,
+	jammedStep = -1,
 }
 function Pipe.clearAt(pos: Vector3): boolean
 	for i = #Pipe.entries, 1, -1 do
@@ -1055,11 +1061,29 @@ local function inboundLanePoints(g: any, c: any): { { Vector3 } }
 	return out
 end
 
+-- A spawn point no car stands on (cached per sim step once found occupied: see Pipe).
+function Pipe.free(pos: Vector3): boolean
+	if Pipe.blockedStep ~= LOD.step then
+		table.clear(Pipe.blocked)
+		Pipe.blockedStep = LOD.step
+	end
+	if Pipe.blocked[pos] then return false end
+	if not spawnBlocked(pos) and Pipe.clearAt(pos) then return true end
+	Pipe.blocked[pos] = true
+	return false
+end
+
 -- Choose an arrival spawn point: scan eligible outside connections (random start so arrivals
 -- spread across entrances) and return the first inbound point that is clear of other cars AND
 -- whose lane can actually route to the home. Scanning all connections and walking past a
 -- stalled car means a single car stuck at one entrance no longer halts all move-ins.
+-- Clearance is looked at BEFORE the route is searched: it is cheap and the same for every
+-- home, while the search is an A* per lane. The old order searched every inbound lane for
+-- every empty home first, so while the entrances were busy each sim step paid a full sweep
+-- of searches per empty home only to find nowhere to spawn -- measured as over half of the
+-- server's whole frame time in a small town with through traffic.
 local function pickArrivalSpawn(g: any, homeKerb: Vector3): Vector3?
+	if Pipe.jammedStep == LOD.step then return nil end
 	if not _outsideConnService then
 		arrivalDiag("no outside connection found -- drag a road to the map edge so traffic can enter")
 		return nil
@@ -1072,59 +1096,79 @@ local function pickArrivalSpawn(g: any, homeKerb: Vector3): Vector3?
 		arrivalDiag("no outside connection found -- drag a road to the map edge so traffic can enter")
 		return nil
 	end
-	-- Every inbound LANE of every connection that can actually route to this home, in a
-	-- random connection order so consecutive arrivals spread across entrances instead of
-	-- stacking on one (a stack conga-lines and wedges at the entrance junction).
+	-- Every inbound LANE of every connection, in a random connection order so consecutive
+	-- arrivals spread across entrances instead of stacking on one (a stack conga-lines and
+	-- wedges at the entrance junction).
 	local start = _rng:NextInteger(1, #eligible)
-	local routable: { { Vector3 } } = {}
-	local laneCount = 0
+	local lanes: { { Vector3 } } = {}
 	for k = 0, #eligible - 1 do
 		local c = eligible[((start - 1 + k) % #eligible) + 1]
-		for _, points in inboundLanePoints(g, c) do
-			laneCount += 1
-			-- The same search the drive will use (driveTo: allowCrossing), so a home the car
-			-- can reach is never reported unreachable: it may finish on EITHER side of the
-			-- home's street, which is what failed for a house whose kerb-side lane only runs
-			-- away from the entrance. The start is priced, not guessed, so an outbound
-			-- dead-end lane at the map edge can no longer be picked. Plain pick as fallback.
-			local pathOk, road = pcall(function() return g:FindPath(points[1], homeKerb, true) end)
-			if not (pathOk and typeof(road) == "table" and #road > 0) then
-				pathOk, road = pcall(function() return g:FindPath(points[1], homeKerb) end)
-			end
-			if pathOk and typeof(road) == "table" and #road > 0 then
-				routable[#routable + 1] = points
-			end
-		end
+		for _, points in inboundLanePoints(g, c) do lanes[#lanes + 1] = points end
 	end
-	if #routable == 0 then
-		-- Name the exact home, the lane the home itself sits on, and every spawn lane tried,
-		-- so a broken road join is findable on the map instead of a mystery (LANES overlay
-		-- marks dead-end lanes). No home lane at all means the house is not on the network.
-		local detail = {}
-		for _, c in eligible do
-			for _, pts in inboundLanePoints(g, c) do
-				table.insert(detail, ("%s spawn=(%d,%d)"):format(tostring(c.id), pts[1].X, pts[1].Z))
-			end
+	-- Can this lane reach the home? The same search the drive will use (driveTo:
+	-- allowCrossing), so a home the car can reach is never reported unreachable: it may
+	-- finish on EITHER side of the home's street, which is what failed for a house whose
+	-- kerb-side lane only runs away from the entrance. Plain search as fallback. Asked at
+	-- most once per lane.
+	local reach: { [number]: boolean } = {}
+	local tested = 0
+	local function routable(li: number): boolean
+		local r = reach[li]
+		if r ~= nil then return r end
+		tested += 1
+		local from = lanes[li][1]
+		local pathOk, road = pcall(function() return g:FindPath(from, homeKerb, true) end)
+		if not (pathOk and typeof(road) == "table" and #road > 0) then
+			pathOk, road = pcall(function() return g:FindPath(from, homeKerb) end)
 		end
-		local nearOk, homeNear = pcall(function() return g:NearestEdge(homeKerb) end)
-		if not nearOk then homeNear = nil end
-		arrivalDiag(("can't route from any of %d inbound lane(s) to the empty home at (%d, %d) [home lane: %s] -- check that its street joins the network (LANES overlay shows dead-end lanes red). tried: %s")
-			:format(laneCount, homeKerb.X, homeKerb.Z,
-				tostring(homeNear and homeNear.edge and homeNear.edge.id or "NONE"),
-				table.concat(detail, ", ")))
-		return nil
+		r = pathOk and typeof(road) == "table" and #road > 0
+		reach[li] = r
+		return r
 	end
 	-- Prefer a clear entrance point (spreads arrivals across connections).
-	for _, points in routable do
-		if not spawnBlocked(points[1]) and Pipe.clearAt(points[1]) then return points[1] end
-	end
-	-- Every entrance is occupied: walk PAST the stalled car, further in on any connection.
-	for _, points in routable do
-		for i = 2, #points do
-			if not spawnBlocked(points[i]) and Pipe.clearAt(points[i]) then return points[i] end
+	local anyClear = false
+	for li, points in lanes do
+		if Pipe.free(points[1]) then
+			anyClear = true
+			if routable(li) then return points[1] end
 		end
 	end
-	arrivalDiag("every outside connection that can reach a home is jammed with stalled cars at the entrance")
+	-- Every entrance is occupied: walk PAST the stalled car, further in on any connection.
+	for li, points in lanes do
+		for i = 2, #points do
+			if Pipe.free(points[i]) then
+				anyClear = true
+				if routable(li) then return points[i] end
+				break -- the lane cannot reach this home from any point on it
+			end
+		end
+	end
+	if not anyClear then
+		Pipe.jammedStep = LOD.step
+		arrivalDiag("every outside connection that can reach a home is jammed with stalled cars at the entrance")
+		return nil
+	end
+	if tested < #lanes then
+		-- Only the busy lanes were left untested: no search just to word the message.
+		arrivalDiag("every outside connection that can reach a home is jammed with stalled cars at the entrance")
+		return nil
+	end
+	-- No lane reaches the home. Name the exact home, the lane the home itself sits on, and
+	-- every spawn lane tried, so a broken road join is findable on the map instead of a
+	-- mystery (LANES overlay marks dead-end lanes). No home lane at all means the house is
+	-- not on the network.
+	local detail = {}
+	for _, c in eligible do
+		for _, pts in inboundLanePoints(g, c) do
+			table.insert(detail, ("%s spawn=(%d,%d)"):format(tostring(c.id), pts[1].X, pts[1].Z))
+		end
+	end
+	local nearOk, homeNear = pcall(function() return g:NearestEdge(homeKerb) end)
+	if not nearOk then homeNear = nil end
+	arrivalDiag(("can't route from any of %d inbound lane(s) to the empty home at (%d, %d) [home lane: %s] -- check that its street joins the network (LANES overlay shows dead-end lanes red). tried: %s")
+		:format(#lanes, homeKerb.X, homeKerb.Z,
+			tostring(homeNear and homeNear.edge and homeNear.edge.id or "NONE"),
+			table.concat(detail, ", ")))
 	return nil
 end
 

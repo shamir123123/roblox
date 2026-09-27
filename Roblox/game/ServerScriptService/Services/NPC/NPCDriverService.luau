@@ -104,6 +104,9 @@ local CONGESTION_JAM_SPEED_RATIO = RoadConstants.NAV_CONGESTION_JAM_SPEED_RATIO 
 local CONGESTION_MIN_QUEUE = RoadConstants.NAV_CONGESTION_MIN_QUEUE or 3
 local TRAFFIC_REROUTE_JAM_TIME = RoadConstants.NAV_REROUTE_JAM_TIME or 7
 local TRAFFIC_REROUTE_COOLDOWN = RoadConstants.NAV_REROUTE_COOLDOWN or 30
+-- Traffic-reroute searches the whole fleet may run: RATE per sim second, at most BURST
+-- saved up, so never more than one search in a single driver tick.
+local RerouteBudget = { RATE = 3, BURST = 1, tokens = 1 }
 local TRAFFIC_REROUTE_MIN_IMPROVEMENT = RoadConstants.NAV_REROUTE_MIN_IMPROVEMENT or 0.3
 local TRAFFIC_REROUTE_MAX_PER_TRIP = RoadConstants.NAV_REROUTE_MAX_PER_TRIP or 2
 local TRAFFIC_REROUTE_REVERSAL_LOCK = RoadConstants.NAV_REROUTE_REVERSAL_LOCK or 60
@@ -1953,11 +1956,12 @@ local function updateTrafficReroute(state: DriverState, dt: number)
 	local edge = g and g:GetEdge(state.edgeId)
 	local speedLimit = if edge then edgeSpeed(edge) else state.speed
 	local slowEnough = (state.currentSpeed or 0) <= math.max(2, speedLimit * CONGESTION_JAM_SPEED_RATIO)
-	local queueGap = getNearestQueueGap(state)
 	local reason = state.stopReason
-	local trafficBlocked = reason == "carAhead" or (reason == "blocked" and queueGap ~= nil)
+	-- The queue scan only when it decides anything: a slow car held for "blocked".
+	local trafficBlocked = slowEnough
+		and (reason == "carAhead" or (reason == "blocked" and getNearestQueueGap(state) ~= nil))
 
-	if trafficBlocked and slowEnough then
+	if trafficBlocked then
 		state.trafficJamTime = (state.trafficJamTime or 0) + dt
 	else
 		state.trafficJamTime = math.max(0, (state.trafficJamTime or 0) - dt * 2)
@@ -1974,6 +1978,11 @@ local function updateTrafficReroute(state: DriverState, dt: number)
 		or now < (state.nextTrafficRerouteAt or 0) then
 		return
 	end
+	-- Each search is a whole A* (~7 ms measured in the lab). A jam makes many drivers impatient
+	-- in the same second; without a shared budget their searches landed in one frame. Over
+	-- budget, the driver simply asks again on a later tick -- its patience is already spent.
+	if RerouteBudget.tokens < 1 then return end
+	RerouteBudget.tokens -= 1
 
 	-- Cool down failed attempts too. A dense queue may have no alternate road, and
 	-- repeated A* searches every driver tick would turn the cure into its own spike.
@@ -4121,6 +4130,7 @@ function NPCDriverService.Start()
 		local tickStart = os.clock()
 		for _ = 1, speed do
 			_simClock += simDt
+			RerouteBudget.tokens = math.min(RerouteBudget.BURST, RerouteBudget.tokens + simDt * RerouteBudget.RATE)
 			rebuildDriverIndexes()
 			local g = nav()
 			if g then publishCongestionSnapshot(g) end

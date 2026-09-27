@@ -41,11 +41,26 @@ function Signal:Once(fn)
 	c = self:Connect(function(...) c:Disconnect(); fn(...) end)
 	return c
 end
+-- Opt-in profiler: set Studio.prof = {} and every signal callback and resumed thread adds its
+-- wall time under "source:line" of the function that was connected / spawned.
+local function profAdd(fn, t0)
+	local prof = Studio.prof
+	if not prof or not fn then return end
+	local src, line = debug.info(fn, "sl")
+	local key = tostring(src) .. ":" .. tostring(line)
+	local e = prof[key]
+	if not e then e = { t = 0, n = 0 }; prof[key] = e end
+	e.t += os.clock() - t0
+	e.n += 1
+end
+Studio.profAdd = profAdd
 function Signal:Fire(...)
 	for _, c in table.clone(self._conns) do
 		if c.Connected then
+			local t0 = os.clock()
 			local ok, err = pcall(c._fn, ...)
 			if not ok then Studio.errors[#Studio.errors + 1] = tostring(err) end
+			if Studio.prof then profAdd(c._fn, t0) end
 		end
 	end
 end
@@ -60,8 +75,11 @@ local timers: { { at: number, seq: number, fn: any, args: any } } = {}
 local deferred: { { fn: any, args: any } } = {}
 local seq = 0
 
+local coFn = setmetatable({}, { __mode = "k" })
 local function resume(co, ...)
+	local t0 = os.clock()
 	local ok, a, b = coroutine.resume(co, ...)
+	if Studio.prof then profAdd(coFn[co], t0) end
 	if not ok then
 		Studio.errors[#Studio.errors + 1] = tostring(a) .. "\n" .. debug.traceback(co)
 		return
@@ -80,6 +98,7 @@ end
 local function run(fn, ...)
 	if type(fn) == "thread" then resume(fn, ...) return fn end
 	local co = coroutine.create(fn)
+	coFn[co] = fn
 	resume(co, ...)
 	return co
 end

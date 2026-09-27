@@ -87,6 +87,10 @@ local LEVEL_FLOOR = 0.5 -- never below half the base draw, however high the leve
 -- always caught), and a pole this close to one ties its line into the street.
 local ROAD_STEP      = 16
 local POLE_ROAD_JOIN = 24
+-- Road points get their own fine hash (built with them, so free per pass): a building only
+-- has to look BUILDING_REACH around itself for a street, not across the wide cells sized
+-- for the biggest generator's yard -- which, full of road points, was most of the pass.
+local ROAD_CELL = 64
 -- The shortage notice repeats this often while the problem lasts, and never faster than
 -- WARN_MIN_GAP however the problem changes.
 local WARN_COOLDOWN = 180
@@ -154,9 +158,11 @@ local _wireLow    = 18.6
 local _wireHigh   = 20.4
 local _wireSpread = 1.9
 
-local _suppliedCell : { [string]: boolean } = {}
+local _suppliedCell : { [number]: boolean } = {}
 local _roadService : any
 local _roadPts   : { Vector3 }? = nil
+local _roadNodes : { Node } = {} -- one grid node per road point, rebuilt with them
+local _roadGrid  : { [number]: { number } } = {} -- ROAD_CELL cell -> indices into _roadPts
 local _roadLinks : { { number } } = {}
 local _roadsDirty = true
 -- Battery state. ponytail: charge is not saved -- a loaded city's batteries start empty
@@ -179,11 +185,14 @@ local _running = false
 
 -- == Geometry ==================================================================
 
-local function cellKey(cx: number, cz: number): string
-	return tostring(cx) .. "|" .. tostring(cz)
+-- A number, not a "cx|cz" string: the grid pass hashes every node and stamps every lit
+-- area each tick, and building strings for that was most of its cost. Unique while
+-- |cz| < 32768 cells -- far beyond the map at any cell size used here.
+local function cellKey(cx: number, cz: number): number
+	return cx * 65536 + cz
 end
 
-local function cellOf(pos: Vector3): string
+local function cellOf(pos: Vector3): number
 	return cellKey(math.floor(pos.X / CELL), math.floor(pos.Z / CELL))
 end
 
@@ -291,7 +300,23 @@ local function buildRoads()
 			tie(#pts, seg.endNode)
 		end
 	end
-	_roadPts, _roadLinks = pts, links
+	-- The road points' grid nodes never change between road edits: built once here and
+	-- shared by every pass, instead of a fresh table per point every tick.
+	local roadNodes: { Node } = table.create(#pts)
+	for i, p in pts do
+		roadNodes[i] = {
+			pos = p, reach = 0, pole = nil, road = true, produce = 0, demand = 0, edge = false,
+			home = false, dead = false,
+		}
+	end
+	local grid: { [number]: { number } } = {}
+	for i, p in pts do
+		local k = cellKey(math.floor(p.X / ROAD_CELL), math.floor(p.Z / ROAD_CELL))
+		local cell = grid[k]
+		if not cell then cell = {}; grid[k] = cell end
+		cell[#cell + 1] = i
+	end
+	_roadPts, _roadLinks, _roadNodes, _roadGrid = pts, links, roadNodes, grid
 	_roadsDirty = false
 end
 
@@ -362,12 +387,7 @@ local function gatherNodes(): ({ Node }, { [number]: number }, number)
 	-- only down the street they sample (_roadLinks).
 	if _roadsDirty or not _roadPts then buildRoads() end
 	local roadBase = #nodes
-	for _, p in _roadPts :: { Vector3 } do
-		nodes[#nodes + 1] = {
-			pos = p, reach = 0, pole = nil, road = true, produce = 0, demand = 0, edge = false,
-			home = false, dead = false,
-		}
-	end
+	table.move(_roadNodes, 1, #_roadNodes, roadBase + 1, nodes)
 
 	return nodes, poleIndex, roadBase
 end
@@ -425,19 +445,40 @@ local function rebuild()
 	-- 2. Supply areas. A building or generator is on the grid of any pole or road point
 	--    standing inside its own area, and two overlapping areas merge. Poles and roads have
 	--    no area of their own, so nothing joins through them except a wire or the street.
-	-- Spatial hash: only nodes in neighbouring buckets can possibly reach each other.
-	local buckets: { [string]: { number } } = {}
-	for i, nd in nodes do
+	-- 2a. Streets: every node with an area (and every pole, POLE_ROAD_JOIN) takes the road
+	--     points inside it, off the road hash.
+	for i = 1, roadBase do
+		local a = nodes[i]
+		local reach = if a.pole then POLE_ROAD_JOIN else a.reach
+		if reach <= 0 then continue end
+		local px, pz = a.pos.X, a.pos.Z
+		local r2 = reach * reach
+		for cx = math.floor((px - reach) / ROAD_CELL), math.floor((px + reach) / ROAD_CELL) do
+			for cz = math.floor((pz - reach) / ROAD_CELL), math.floor((pz + reach) / ROAD_CELL) do
+				local cell = _roadGrid[cellKey(cx, cz)]
+				if not cell then continue end
+				for _, k in cell do
+					local o = _roadPts[k]
+					local ox, oz = px - o.X, pz - o.Z
+					if ox * ox + oz * oz <= r2 then union(i, roadBase + k) end
+				end
+			end
+		end
+	end
+	-- 2b. Everything else (roads excluded): a pole only has to stand INSIDE an area; two areas
+	--     have to overlap. Spatial hash: only nodes in neighbouring buckets can reach each other.
+	local buckets: { [number]: { number } } = {}
+	for i = 1, roadBase do
+		local nd = nodes[i]
 		local k = cellKey(math.floor(nd.pos.X / _bucket), math.floor(nd.pos.Z / _bucket))
 		local b = buckets[k]
 		if not b then b = {}; buckets[k] = b end
 		b[#b + 1] = i
 	end
-	for i, a in nodes do
-		-- A pole beside a street ties its line into the street: that is how a line from a
-		-- turbine out in a field lights a town without a pole at every door.
-		local reach = if a.pole then POLE_ROAD_JOIN else a.reach
-		if reach <= 0 then continue end -- road points reach nothing on their own
+	for i = 1, roadBase do
+		local a = nodes[i]
+		local reach = a.reach
+		if a.pole or reach <= 0 then continue end -- poles only grab streets (2a)
 		local bx = math.floor(a.pos.X / _bucket)
 		local bz = math.floor(a.pos.Z / _bucket)
 		for dx = -1, 1 do
@@ -447,8 +488,6 @@ local function rebuild()
 				for _, j in b do
 					if j == i then continue end
 					local o = nodes[j]
-					if a.pole and not o.road then continue end -- poles only grab streets
-					-- A pole only has to stand INSIDE the area; two areas have to overlap.
 					local limit = if o.reach > 0 then reach + o.reach else reach
 					if j > i or o.reach <= 0 then
 						local ox, oz = a.pos.X - o.pos.X, a.pos.Z - o.pos.Z

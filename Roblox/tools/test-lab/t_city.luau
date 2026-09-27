@@ -51,12 +51,30 @@ if process.env.THROUGH ~= "1" then
 	Studio.expose("ServerScriptService.Services.City.Simulation.ThroughTrafficService", "ThroughTrafficService.Start = function() end")
 end
 
+-- PROFFN="NPC.NPCDriverService:updateDriver,stallWatchdog;City.PowerService:rebuild": inclusive
+-- wall time of those module-local functions (reassigned in place, so every caller is timed).
+local profFns = {}
+for spec in (process.env.PROFFN or ""):gmatch("[^;]+") do
+	local mod, fns = spec:match("^([^:]+):(.+)$")
+	local full = "ServerScriptService.Services." .. mod
+	local name = mod:match("([^%.]+)$")
+	local code = {}
+	for fn in fns:gmatch("[^,]+") do
+		table.insert(code, ("%s.__o_%s = %s\n%s = function(...) local c = %s.__clock; if not c then return %s.__o_%s(...) end " ..
+			"local t0 = c(); local r = table.pack(%s.__o_%s(...)); local e = %s.__pf[%q]; if not e then e = { 0, 0 }; %s.__pf[%q] = e end; e[1] += c() - t0; e[2] += 1; return table.unpack(r, 1, r.n) end")
+			:format(name, fn, fn, fn, name, name, fn, name, fn, name, name .. "." .. fn, name, name .. "." .. fn))
+	end
+	Studio.expose(full, name .. ".__pf = {}\n" .. table.concat(code, "\n"))
+	table.insert(profFns, full)
+end
+
 local boot = Studio.find("ServerScriptService.Bootstrap.Bootstrap")
 Studio.task.spawn(function()
 	local ok, err = pcall(Studio.loadWith, boot, {})
 	if not ok then print("BOOT ERROR", err) end
 end)
 for _ = 1, 20 do Studio.step(0.1) end
+for _, full in profFns do Studio.require(Studio.find(full)).__clock = os.clock end
 local W = Studio.game.Workspace
 W:SetAttribute("Sandbox", true)
 W:SetAttribute("RoadEditOpen", true)
@@ -177,6 +195,9 @@ local startDay = TimeService.getDay()
 local peakCars, hourlyRows = 0, {}
 local endDay = startDay + DAYS
 local served = R("ServerScriptService.Services.City.BuildingService").__records
+-- PROF=1: wall time per connected callback / spawned thread over the run, per sim second.
+if process.env.PROF == "1" then Studio.prof = {} end
+local wall0 = os.clock()
 while TimeService.getDay() + TimeService.getDayFraction() < endDay + 0.5 and t < DAYS * dayLen * 4 do
 	-- (lab: every building counts as powered and watered -- see the CitizenService override)
 	for _, rec in served do rec.powered = true; rec.watered = true; rec.drained = true end
@@ -332,6 +353,20 @@ do
 	for k, v in Citizens.__trips do table.insert(parts, k .. " " .. v) end
 	table.sort(parts)
 	print("trips started by purpose: " .. table.concat(parts, ", "))
+end
+if Studio.prof then
+	local rows, total = {}, 0
+	for k, e in Studio.prof do table.insert(rows, { k = k, t = e.t, n = e.n }); total += e.t end
+	table.sort(rows, function(a, b) return a.t > b.t end)
+	print(("PROF %.1f s wall for %.0f sim s (%.1f ms per sim s); callbacks %.1f s"):format(os.clock() - wall0, t, (os.clock() - wall0) * 1000 / t, total))
+	for _, full in profFns do
+		for k, v in R(full).__pf do table.insert(rows, { k = "FN " .. k, t = v[1], n = v[2] }) end
+	end
+	table.sort(rows, function(a, b) return a.t > b.t end)
+	for i = 1, math.min(30, #rows) do
+		local r = rows[i]
+		print(("PROF %6.2f ms/sim-s  %5.1f%%  %7d calls  %s"):format(r.t * 1000 / t, r.t * 100 / total, r.n, r.k:gsub("^.*ServerScriptService%.", ""):gsub("^.*ReplicatedStorage%.", "RS.")))
+	end
 end
 print("errors", #Studio.errors)
 for i = 1, math.min(5, #Studio.errors) do print("ERR", Studio.errors[i]:sub(1, 300)) end
