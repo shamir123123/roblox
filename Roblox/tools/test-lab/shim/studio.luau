@@ -293,9 +293,11 @@ local function partsOf(self)
 end
 function methods.GetPivot(self)
 	if methods.IsA(self, "BasePart") then return self._props.CFrame end
-	if self._props.WorldPivot then return self._props.WorldPivot end
+	-- Roblox: a model with a PrimaryPart pivots on it (WorldPivot only counts without one),
+	-- so moving the PrimaryPart moves the pivot.
 	local pp = self._props.PrimaryPart
 	if pp then return pp._props.CFrame end
+	if self._props.WorldPivot then return self._props.WorldPivot end
 	local parts = partsOf(self)
 	if #parts > 0 then return parts[1]._props.CFrame end
 	return CFrame.new()

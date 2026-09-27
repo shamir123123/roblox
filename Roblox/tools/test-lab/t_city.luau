@@ -10,6 +10,9 @@
 --   study  -- students (18-22) enrolled at the university, during class hours
 -- plus households, cars on the road and trips by purpose, hour by hour.
 -- usage: lune run t_city.luau <game days> [seed] [hourly]
+-- env: THROUGH=1 through traffic on | ENTRANCE=1 hourly look at the map-edge entrances and
+--      what any stopped car there waits on | WHY=1 each worker at home in their shift, and
+--      why | LONGLF=1 warn on any off-road line-follow over 800 studs, and the directed routes
 local process = require("@lune/process")
 local DAYS = tonumber(process.args[1]) or 2
 local SEED = tonumber(process.args[2]) or 1
@@ -29,14 +32,20 @@ Studio.expose("ServerScriptService.Services.City.Simulation.CitizenService",
 	"do local __views = CitizenService._svcViews; CitizenService._svcViews = function(...) local v = __views(...); " ..
 	"for _, b in v do b.powered = true; b.watered = true; b.drained = true end; return v end end\n" ..
 	"CitizenService.__trips = {}\n" ..
+	"if " .. (if process.env.LONGLF == "1" then "true" else "false") .. " then local lf = lineFollow; lineFollow = function(car, wps, ...) local cum = PathFollower.cumOf(wps); " ..
+	"if (cum[#cum] or 0) > 800 then warn('LONGLF ' .. #wps .. ' pts ' .. math.floor(cum[#cum]) .. ' from ' .. tostring(wps[1]) .. ' to ' .. tostring(wps[#wps]) .. ' ' .. debug.traceback()) end; return lf(car, wps, ...) end end\n" ..
 	"do local se = startErrand; startErrand = function(h, a, kind, ...) CitizenService.__trips[kind] = (CitizenService.__trips[kind] or 0) + 1; return se(h, a, kind, ...) end end\n" ..
 	"do local sw = startWork; startWork = function(...) CitizenService.__trips.work = (CitizenService.__trips.work or 0) + 1; return sw(...) end end\n" ..
 	"do local ss = startSchool; startSchool = function(...) local ok = ss(...); if ok then CitizenService.__trips.school = (CitizenService.__trips.school or 0) + 1 end; return ok end end\n" ..
 	"do local tc = Trips.toClass; Trips.toClass = function(...) CitizenService.__trips.class = (CitizenService.__trips.class or 0) + 1; return tc(...) end end\n" ..
-	"CitizenService.__test = { households = _households, shiftHours = shiftHours, offset = householdShiftOffsetHours, " ..
+	"CitizenService.__test = { trips = _trips, tokens = _carDriveTokens, households = _households, shiftHours = shiftHours, offset = householdShiftOffsetHours, " ..
 	"schoolOffset = schoolShiftOffsetHours }")
 Studio.expose("ServerScriptService.Services.City.PlotService", "PlotService.__place = place")
-Studio.expose("ServerScriptService.Services.NPC.NPCDriverService", "NPCDriverService.__test = { drivers = _drivers }")
+Studio.expose("ServerScriptService.Services.City.BuildingService", "BuildingService.__records = _buildings")
+Studio.expose("ServerScriptService.Services.NPC.NPCDriverService", "NPCDriverService.__test = { drivers = _drivers }" ..
+	(if process.env.LONGLF == "1" then "\ndo local dd = NPCDriverService.DriveDirected; NPCDriverService.DriveDirected = function(model, s, gpos, route, ...) " ..
+	"if model.Name == 'CitizenCar' then warn(('DRIVE %s from (%.0f,%.0f) to (%.0f,%.0f) route %d edges first %s last %s'):format(model.Name, s.X, s.Z, gpos.X, gpos.Z, #route, tostring(route[1]), tostring(route[#route]))) end " ..
+	"return dd(model, s, gpos, route, ...) end end" else ""))
 -- Through traffic off unless asked for (THROUGH=1): this measures the town's own trips.
 if process.env.THROUGH ~= "1" then
 	Studio.expose("ServerScriptService.Services.City.Simulation.ThroughTrafficService", "ThroughTrafficService.Start = function() end")
@@ -167,7 +176,10 @@ local t = 0
 local startDay = TimeService.getDay()
 local peakCars, hourlyRows = 0, {}
 local endDay = startDay + DAYS
+local served = R("ServerScriptService.Services.City.BuildingService").__records
 while TimeService.getDay() + TimeService.getDayFraction() < endDay + 0.5 and t < DAYS * dayLen * 4 do
+	-- (lab: every building counts as powered and watered -- see the CitizenService override)
+	for _, rec in served do rec.powered = true; rec.watered = true; rec.drained = true end
 	Studio.step(DT)
 	t += DT
 	local hour = TimeService.getDayFraction() * 24
@@ -208,6 +220,21 @@ while TimeService.getDay() + TimeService.getDayFraction() < endDay + 0.5 and t <
 			end
 		end
 		table.insert(hourlyRows, row)
+		if process.env.ENTRANCE == "1" then
+			local D = R("ServerScriptService.Services.NPC.NPCDriverService").__test.drivers
+			for _, x in { -4090, 4090 } do
+				local n, stopped, names = 0, 0, {}
+				for m, st in D do
+					local p = st.smoothCFrame and st.smoothCFrame.Position
+					if p and math.abs(p.X - x) < 80 and math.abs(p.Z) < 30 then
+						n += 1
+						if (st.currentSpeed or 0) < 0.5 then stopped += 1 end
+						if #names < 3 then table.insert(names, ("%s@%.0f,%.0f v%.1f %s"):format(m.Name, p.X, p.Z, st.currentSpeed or 0, tostring(st.stopReason))) end
+					end
+				end
+				print(("  d%d %02dh entrance x=%d: %d cars (%d stopped) %s"):format(row.day, hi, x, n, stopped, table.concat(names, " | ")))
+			end
+		end
 		if HOURLY then
 			local bz = { Residential = 0, Commercial = 0, Industrial = 0 }
 			local sites = W:FindFirstChild("_City") and W._City:FindFirstChild("ConstructionSites")
@@ -245,6 +272,43 @@ do
 	print(("kids %d (ages %s), school age %d, with a school %d | adults wanting university %d, enrolled %d")
 		:format(kids, table.concat(ages, ","), schoolAge, assigned, wants, students))
 end
+if process.env.ENTRANCE == "1" then
+	-- The head of any stopped queue near the east entrance, and what it is waiting on.
+	local D = R("ServerScriptService.Services.NPC.NPCDriverService").__test.drivers
+	for m, st in D do
+		local p = st.smoothCFrame and st.smoothCFrame.Position
+		if p and p.X > 3600 and math.abs(p.Z) < 30 and (st.currentSpeed or 0) < 0.5 then
+			local b = st.blockedBy
+			local bst = b and D[b]
+			local bp = b and b:GetPivot().Position
+			print(("  STOPPED %s @(%.0f,%.0f) edge %s@%.0f conn %s next %s reason %s blockedBy %s%s")
+				:format(m.Name, p.X, p.Z, tostring(st.edgeId), st.edgeDist or 0, tostring(st.connector ~= nil), tostring(st.nextEdgeId or st.pendingNextEdgeId),
+					tostring(st.stopReason), b and b.Name or "-",
+					if b then (" @(%.0f,%.0f) registered %s state %s"):format(bp.X, bp.Z, tostring(bst ~= nil), bst and (tostring(bst.edgeId) .. " v" .. tostring(bst.currentSpeed) .. " " .. tostring(bst.stopReason)) or "-") else ""))
+		end
+	end
+end
+if process.env.ENTRANCE == "1" then
+	local folder = W._City:FindFirstChild("Citizens")
+	for _, m in (folder and folder:GetChildren() or {}) do
+		if m:IsA("Model") then
+			local p = m:GetPivot().Position
+			if p.X > 3600 and math.abs(p.Z) < 30 then
+				local owner = "none"
+				for hid, h in T.households do
+					for _, a in h.adults do
+						if a.car == m then owner = ("household %d adult %s stage %s arriving %s"):format(hid, a.name, a.stage, tostring(h.arriving)) end
+					end
+				end
+				local tr = T.trips[m]
+				print(("  CITIZENCAR %s @(%.0f,%.0f) pid %s purpose %s owner %s trip %s gate %s dist %.1f/%.1f stall %.1f directed %s")
+					:format(m.Name, p.X, p.Z, tostring(m:GetAttribute("CitizenPid")), tostring(m:GetAttribute("TripPurpose")), owner,
+						tostring(tr ~= nil), tostring(tr and tr.gate ~= nil), tr and tr.dist or -1, tr and tr.cum[#tr.cum] or -1, tr and tr.stallTime or -1,
+						tostring(R("ServerScriptService.Services.NPC.NPCDriverService").IsDirected(m))))
+			end
+		end
+	end
+end
 -- What stands at the map-edge entrances (move-ins wait for them to clear).
 do
 	local D = R("ServerScriptService.Services.NPC.NPCDriverService").__test.drivers
@@ -276,6 +340,6 @@ for _, w in Studio.warnings do
 	local k = w:sub(1, 60)
 	if not seen[k] and not w:find("DataStore") and not w:find("MemoryStore") and not w:find("PlayerGui") and not w:find("WaitForChild miss") then
 		seen[k] = true
-		print("WARN", w:sub(1, 200))
+		print("WARN", if w:find("LONGLF") then w else w:sub(1, 200))
 	end
 end
