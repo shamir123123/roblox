@@ -34,7 +34,7 @@ local MAX_CREATE_SLOTS  = 3   -- max NEW cities a player may create
 local MAX_CREATE_INVITES = 4
 local MAX_NAME_LENGTH   = 40
 local DEFAULT_CITY_NAME = "New City"
-local AUTOSAVE_INTERVAL = 600
+local AUTOSAVE_INTERVAL = 300 -- s; at most five minutes of play can be lost to a crash
 local MAX_RETRIES       = 3
 local RETRY_DELAY       = 2
 -- Lock refreshes on every autosave (180s), so TTL is two intervals + slack.
@@ -281,18 +281,48 @@ local function writeIndex(userId: number, index: IndexData, release: boolean): b
 end
 
 -- Chunk 1 keeps the plain slot key, so every save written before chunking still loads;
--- chunk N > 1 lives at "<slot key>_cN".
+-- chunk N > 1 lives at "<slot key>_cN". (LEGACY layout: read, never written any more.)
 local function chunkKey(userId: number, slotId: number, index: number): string
 	local base = slotKey(userId, slotId)
 	return if index <= 1 then base else base .. "_c" .. tostring(index)
 end
 
--- Chunk 1 opens with a 2-byte header {0xFF, chunkCount}, so a save describes its own
--- layout and no separate index has to stay in agreement with it. 0xFF can never start a
+-- Legacy chunk 1 opened with a 2-byte header {0xFF, chunkCount}. 0xFF can never start a
 -- pre-chunking blob: those begin with the Zstd frame magic (0x28).
 local CHUNK_MAGIC = 0xFF
 
-local function splitPacked(packed: buffer): { buffer }
+-- == Generations: crash-safe saves ==========================================
+-- A save is written as a whole new GENERATION beside the ones already stored -- every chunk
+-- under its own keys -- and only then does the slot key, now a 2-byte pointer, switch to it
+-- in a single write. A crash, a shutdown or a failed write at any point before that switch
+-- leaves the pointer on the last complete save. (The old layout overwrote the same chunk
+-- keys in place, so a save cut off half way left the city's first chunk pointing at a mix
+-- of old and new data: a large city could be lost to one bad moment.)
+--   * Three generations rotate, and the one a session LOADED is never overwritten during
+--     that session: whatever that session does -- a bug that empties a section, two bad
+--     autosaves in a row -- the city as it was when the player joined is still stored.
+--   * If the newest save ever fails to decode, loading falls back on its own to the newest
+--     readable earlier generation (a sequence number in each generation's header orders
+--     them) and the next save goes over the broken one.
+-- Layout: slot key = { POINTER_MAGIC, gen }; generation g chunk i at "<slot>_g<g>c<i>",
+-- chunk 1 opening with { GEN_HEAD_MAGIC, count, seq (u32) }.
+local POINTER_MAGIC = 0xFD
+local GEN_HEAD_MAGIC = 0xFC
+local GEN_HEAD_BYTES = 6
+local GENERATIONS = 3
+-- Per "<userId>:<slotId>": the generation the pointer names, the one this session loaded
+-- (-1 = a legacy-layout save), and the highest sequence number seen.
+local _slotGen: { [string]: { current: number, loaded: number, seq: number } } = {}
+
+local function genKey(userId: number, slotId: number): string
+	return tostring(userId) .. ":" .. tostring(slotId)
+end
+
+local function genChunkKey(userId: number, slotId: number, gen: number, index: number): string
+	return slotKey(userId, slotId) .. "_g" .. tostring(gen) .. "c" .. tostring(index)
+end
+
+local function splitPacked(packed: buffer, seq: number): { buffer }
 	local total = buffer.len(packed)
 	local count = math.max(1, math.ceil(total / CHUNK_PAYLOAD_BYTES))
 	local parts: { buffer } = {}
@@ -300,32 +330,33 @@ local function splitPacked(packed: buffer): { buffer }
 	for i = 1, count do
 		local size = math.min(CHUNK_PAYLOAD_BYTES, total - at)
 		local head = i == 1
-		local part = buffer.create(if head then size + 2 else size)
+		local part = buffer.create(if head then size + GEN_HEAD_BYTES else size)
 		if head then
-			buffer.writeu8(part, 0, CHUNK_MAGIC)
+			buffer.writeu8(part, 0, GEN_HEAD_MAGIC)
 			buffer.writeu8(part, 1, count)
+			buffer.writeu32(part, 2, seq % 4294967296)
 		end
-		buffer.copy(part, if head then 2 else 0, packed, at, size)
+		buffer.copy(part, if head then GEN_HEAD_BYTES else 0, packed, at, size)
 		parts[i] = part
 		at += size
 	end
 	return parts
 end
 
-local function writeChunk(userId: number, slotId: number, index: number, value: any): boolean
+local function writeKey(key: string, value: any, label: string): boolean
 	local store = _store
 	if not store then return false end
 
 	for attempt = 1, MAX_RETRIES do
 		local ok, err = pcall(function()
-			store:UpdateAsync(chunkKey(userId, slotId, index), function()
+			store:UpdateAsync(key, function()
 				return value
 			end)
 		end)
 
 		if ok then return true end
 
-		warn(string.format("[CitySlotService] slot %d chunk %d write attempt %d/%d failed for %d: %s", slotId, index, attempt, MAX_RETRIES, userId, tostring(err)))
+		warn(string.format("[CitySlotService] %s write attempt %d/%d failed: %s", label, attempt, MAX_RETRIES, tostring(err)))
 
 		if attempt < MAX_RETRIES then
 			task.wait(RETRY_DELAY * attempt)
@@ -335,44 +366,18 @@ local function writeChunk(userId: number, slotId: number, index: number, value: 
 	return false
 end
 
--- ponytail: writes are not atomic ACROSS keys -- a crash partway through leaves chunk 1
--- pointing at a mix of old and new tail chunks, and recovery is the once-per-session _bak
--- copy. Double-buffer (A/B key sets) only if that ever actually bites.
-local function writeSlotBlob(userId: number, slotId: number, blob: any): boolean
-	-- The legacy migration path still hands over a plain table; it never needs chunking.
-	if typeof(blob) ~= "buffer" then
-		return writeChunk(userId, slotId, 1, blob)
-	end
-
-	local parts = splitPacked(blob)
-	if #parts > CHUNK_LIMIT then
-		warn(string.format("[CitySlotService] slot %d for %d needs %d chunks, cap is %d", slotId, userId, #parts, CHUNK_LIMIT))
-		return false
-	end
-
-	-- Tail first, head last: chunk 1 declares the layout, so it only starts claiming the
-	-- new chunks once they are all actually stored.
-	for i = #parts, 1, -1 do
-		if not writeChunk(userId, slotId, i, parts[i]) then return false end
-	end
-	-- A city that shrank leaves its old tail keys behind. They are never read (the header
-	-- says how many count) and get overwritten if it grows again -- not worth two extra
-	-- DataStore writes on every save to tidy.
-	return true
-end
-
-local function readChunk(userId: number, slotId: number, index: number): (any, boolean)
+local function readKey(key: string, label: string): (any, boolean)
 	local store = _store
 	if not store then return nil, true end
 
 	for attempt = 1, MAX_RETRIES do
 		local ok, result = pcall(function()
-			return store:GetAsync(chunkKey(userId, slotId, index))
+			return store:GetAsync(key)
 		end)
 
 		if ok then return result, true end
 
-		warn(string.format("[CitySlotService] slot %d chunk %d read attempt %d/%d failed for %d: %s", slotId, index, attempt, MAX_RETRIES, userId, tostring(result)))
+		warn(string.format("[CitySlotService] %s read attempt %d/%d failed: %s", label, attempt, MAX_RETRIES, tostring(result)))
 
 		if attempt < MAX_RETRIES then
 			task.wait(RETRY_DELAY * attempt)
@@ -382,12 +387,141 @@ local function readChunk(userId: number, slotId: number, index: number): (any, b
 	return nil, false
 end
 
+local function joinParts(parts: { buffer }): buffer
+	local total = 0
+	for _, p in parts do total += buffer.len(p) end
+	local joined = buffer.create(total)
+	local at = 0
+	for _, p in parts do
+		buffer.copy(joined, at, p, 0, buffer.len(p))
+		at += buffer.len(p)
+	end
+	return joined
+end
+
+-- One generation, whole: (blob, readOk, seq). readOk false = the DataStore could not be
+-- read (try again later); readOk true with a nil blob = that generation is missing or broken.
+local function readGeneration(userId: number, slotId: number, gen: number): (any, boolean, number)
+	local label = string.format("slot %d gen %d for %d", slotId, gen, userId)
+	local head, okHead = readKey(genChunkKey(userId, slotId, gen, 1), label)
+	if not okHead then return nil, false, -1 end
+	if typeof(head) ~= "buffer" or buffer.len(head) < GEN_HEAD_BYTES or buffer.readu8(head, 0) ~= GEN_HEAD_MAGIC then
+		return nil, true, -1
+	end
+	local count = math.clamp(buffer.readu8(head, 1), 1, CHUNK_LIMIT)
+	local seq = buffer.readu32(head, 2)
+	local parts: { buffer } = {}
+	local headLen = buffer.len(head) - GEN_HEAD_BYTES
+	parts[1] = buffer.create(headLen)
+	buffer.copy(parts[1], 0, head, GEN_HEAD_BYTES, headLen)
+	for i = 2, count do
+		local part, okPart = readKey(genChunkKey(userId, slotId, gen, i), label)
+		if not okPart then return nil, false, seq end
+		if typeof(part) ~= "buffer" then
+			warn(string.format("[CitySlotService] slot %d gen %d for %d is missing chunk %d of %d", slotId, gen, userId, i, count))
+			return nil, true, seq
+		end
+		parts[i] = part
+	end
+	local okUnpack, blob = pcall(BlobCodec.unpack, joinParts(parts))
+	return if okUnpack then blob else nil, true, seq
+end
+
+-- Writes the city as a new generation, then points the slot at it (see Generations).
+local function writeSlotBlob(userId: number, slotId: number, blob: any): boolean
+	-- The legacy migration path still hands over a plain table; it never needs chunking.
+	if typeof(blob) ~= "buffer" then
+		return writeKey(slotKey(userId, slotId), blob, string.format("slot %d for %d", slotId, userId))
+	end
+
+	local k = genKey(userId, slotId)
+	local g = _slotGen[k]
+	if not g then
+		-- Not loaded by this server (a save straight after create): ask the pointer.
+		local head, ok = readKey(slotKey(userId, slotId), string.format("slot %d pointer for %d", slotId, userId))
+		if not ok then return false end
+		local cur = -1
+		if typeof(head) == "buffer" and buffer.len(head) >= 2 and buffer.readu8(head, 0) == POINTER_MAGIC then
+			cur = buffer.readu8(head, 1)
+		end
+		g = { current = cur, loaded = cur, seq = 0 }
+		_slotGen[k] = g
+	end
+	local state = g :: { current: number, loaded: number, seq: number }
+
+	-- Never the generation the pointer names now, never the one this session loaded.
+	local newGen = 0
+	while newGen == state.current or newGen == state.loaded do newGen += 1 end
+	if newGen >= GENERATIONS then newGen = 0 end
+
+	-- Wall-clock ordered, so generations written by different servers still sort right.
+	local seq = math.max(state.seq + 1, os.time())
+	local parts = splitPacked(blob, seq)
+	if #parts > CHUNK_LIMIT then
+		warn(string.format("[CitySlotService] slot %d for %d needs %d chunks, cap is %d", slotId, userId, #parts, CHUNK_LIMIT))
+		return false
+	end
+
+	local label = string.format("slot %d gen %d for %d", slotId, newGen, userId)
+	for i = #parts, 1, -1 do
+		if not writeKey(genChunkKey(userId, slotId, newGen, i), parts[i], label) then return false end
+	end
+	-- The switch: one small write. Until it lands, the last save is what loads.
+	local pointer = buffer.create(2)
+	buffer.writeu8(pointer, 0, POINTER_MAGIC)
+	buffer.writeu8(pointer, 1, newGen)
+	if not writeKey(slotKey(userId, slotId), pointer, string.format("slot %d pointer for %d", slotId, userId)) then
+		return false
+	end
+	local wasLegacy = state.current < 0
+	state.current = newGen
+	state.seq = seq
+	if wasLegacy then
+		-- The legacy layout's tail chunks now belong to nothing (its chunk 1 was the slot key).
+		task.spawn(function()
+			local store = _store
+			if not store then return end
+			for i = 2, CHUNK_LIMIT do pcall(function() store:RemoveAsync(chunkKey(userId, slotId, i)) end) end
+		end)
+	end
+	return true
+end
+
 -- Reassembles a city from however many keys it was stored across. A missing or unreadable
--- tail chunk is a read FAILURE, never an empty slot -- reporting ok would load a fresh
--- city and then autosave straight over the player's real one.
+-- chunk of a LEGACY save is a read FAILURE, never an empty slot -- reporting ok would load a
+-- fresh city and then autosave straight over the player's real one.
 local function readSlotBlob(userId: number, slotId: number): (any, boolean)
-	local head, okHead = readChunk(userId, slotId, 1)
+	local k = genKey(userId, slotId)
+	local head, okHead = readKey(slotKey(userId, slotId), string.format("slot %d for %d", slotId, userId))
 	if not okHead then return nil, false end
+
+	if typeof(head) == "buffer" and buffer.len(head) >= 2 and buffer.readu8(head, 0) == POINTER_MAGIC then
+		local gen = buffer.readu8(head, 1)
+		local blob, readOk, seq = readGeneration(userId, slotId, gen)
+		if not readOk then return nil, false end
+		if blob ~= nil then
+			_slotGen[k] = { current = gen, loaded = gen, seq = math.max(seq, 0) }
+			return blob, true
+		end
+		-- The newest save is broken: the newest readable earlier generation, then.
+		local best, bestGen, bestSeq = nil, -1, -1
+		for other = 0, GENERATIONS - 1 do
+			if other == gen then continue end
+			local b, ok2, s2 = readGeneration(userId, slotId, other)
+			if not ok2 then return nil, false end
+			if b ~= nil and s2 > bestSeq then best, bestGen, bestSeq = b, other, s2 end
+		end
+		if best == nil then
+			warn(string.format("[CitySlotService] slot %d for %d: no readable generation", slotId, userId))
+			return nil, false
+		end
+		warn(string.format("[CitySlotService] slot %d for %d: newest save (gen %d) unreadable -- recovered gen %d", slotId, userId, gen, bestGen))
+		-- current = the broken one, so the next save goes over it and keeps the recovered one.
+		_slotGen[k] = { current = gen, loaded = bestGen, seq = math.max(bestSeq, seq) }
+		return best, true
+	end
+
+	_slotGen[k] = { current = -1, loaded = -1, seq = 0 }
 	-- Plain table: a save from before compression. Nothing to reassemble.
 	if typeof(head) ~= "buffer" then return head, true end
 
@@ -403,7 +537,7 @@ local function readSlotBlob(userId: number, slotId: number): (any, boolean)
 	buffer.copy(parts[1], 0, head, offset, headLen)
 
 	for i = 2, count do
-		local part, okPart = readChunk(userId, slotId, i)
+		local part, okPart = readKey(chunkKey(userId, slotId, i), string.format("slot %d chunk %d for %d", slotId, i, userId))
 		if not okPart or typeof(part) ~= "buffer" then
 			warn(string.format("[CitySlotService] slot %d for %d is missing chunk %d of %d", slotId, userId, i, count))
 			return nil, false
@@ -411,16 +545,7 @@ local function readSlotBlob(userId: number, slotId: number): (any, boolean)
 		parts[i] = part
 	end
 
-	local total = 0
-	for _, p in parts do total += buffer.len(p) end
-	local joined = buffer.create(total)
-	local at = 0
-	for _, p in parts do
-		buffer.copy(joined, at, p, 0, buffer.len(p))
-		at += buffer.len(p)
-	end
-
-	local blob = BlobCodec.unpack(joined)
+	local blob = BlobCodec.unpack(joinParts(parts))
 	return blob, blob ~= nil
 end
 
@@ -448,15 +573,23 @@ local function removeSlotBlob(userId: number, slotId: number)
 	local store = _store
 	if not store then return end
 
+	local keys: { string } = { slotKey(userId, slotId) .. "_bak" }
 	for i = 1, CHUNK_LIMIT do
+		table.insert(keys, chunkKey(userId, slotId, i)) -- legacy layout (i = 1 is the pointer too)
+		for gen = 0, GENERATIONS - 1 do
+			table.insert(keys, genChunkKey(userId, slotId, gen, i))
+		end
+	end
+	for _, key in keys do
 		local ok, err = pcall(function()
-			store:RemoveAsync(chunkKey(userId, slotId, i))
+			store:RemoveAsync(key)
 		end)
 
 		if not ok then
-			warn(string.format("[CitySlotService] slot %d chunk %d remove failed for %d: %s", slotId, i, userId, tostring(err)))
+			warn(string.format("[CitySlotService] %s remove failed for %d: %s", key, userId, tostring(err)))
 		end
 	end
+	_slotGen[genKey(userId, slotId)] = nil
 end
 
 -- ---------- migration ----------
@@ -867,7 +1000,8 @@ end
 
 -- ---------- saving ----------
 
--- Safety net: once per server session, copy the slot blob AS LOADED to "<slot>_bak"
+-- Safety net for LEGACY-layout saves (a generation-layout save keeps the city as the
+-- session loaded it by itself, see Generations): once per server session, copy the slot blob AS LOADED to "<slot>_bak"
 -- before the first overwrite. A buggy serializer / half-wiped city can then never
 -- destroy the only copy of a save. Best-effort and never blocks the save itself.
 -- ponytail: recovery is manual (read the _bak key); add an admin restore if it's ever needed twice.
@@ -877,6 +1011,9 @@ local function backupSlotOnce(userId: number, slotId: number)
 	if not store then return end
 	local key = tostring(userId) .. ":" .. tostring(slotId)
 	if _bakDone[key] then return end
+	-- A generation-layout save already keeps the city as this session loaded it.
+	local g = _slotGen[key]
+	if g and g.loaded >= 0 then _bakDone[key] = true return end
 	local ok = pcall(function()
 		local raw = store:GetAsync(slotKey(userId, slotId))
 		if raw ~= nil then
@@ -973,7 +1110,7 @@ local function saveActiveSlot(userId: number, release: boolean): boolean
 		-- serializer bug that silently empties a section is noticed the day it ships.
 		local prevBytes = math.max(0, tonumber(meta.bytes) or 0)
 		if prevBytes > 8192 and blobBytes < prevBytes * 0.2 then
-			warn(string.format("[CitySlotService] save for %d shrank %d KB -> %d KB -- pre-session copy kept at _bak", userId, prevBytes // 1024, blobBytes // 1024))
+			warn(string.format("[CitySlotService] save for %d shrank %d KB -> %d KB -- the city as this session loaded it is still stored", userId, prevBytes // 1024, blobBytes // 1024))
 		end
 
 		local reject = budgetReject(session.index, slotId, blobBytes)
