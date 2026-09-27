@@ -19,6 +19,7 @@ for sd in 1 2; do echo "lune run t_s9_hwyjunction.luau $M 300 $sd > $O/s9_$sd.tx
 for sd in 1 2; do echo "lune run t_s10_lanes.luau $M 240 $sd > $O/s10_$sd.txt 2>&1"; done
 echo "lune run t_lights_toggle.luau > $O/lights.txt 2>&1"
 echo "lune run t_signs.luau > $O/signs.txt 2>&1"
+echo "lune run t_city.luau 2 1 > $O/city.txt 2>&1"
 for sd in 1 2; do echo "lune run t_s8_stream.luau $M 200 $sd 1500 > $O/s8_$sd.txt 2>&1"; done
 } | xargs -P 4 -I{} sh -c "{}"
 echo REGDONE

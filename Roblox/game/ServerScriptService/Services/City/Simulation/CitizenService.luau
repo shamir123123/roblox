@@ -55,7 +55,6 @@ local SCHOOL_AGE_MIN     = 5    -- youngest child that walks to school
 local SCHOOL_AGE_MAX     = 17   -- oldest child that attends (18 promotes to a working adult)
 local SCHOOL_START_HOUR  = 8.0
 local SCHOOL_END_HOUR    = 15.0
-local SCHOOL_WINDOW_HOURS = 1.25
 local MOTHER_FERTILE_MAX = 45   -- births only while the mother is under this age
 local FAMILY_INFO_MIN_DT = 0.15 -- rate-limit (s) for the family-info panel request
 local LEAVE_JOBLESS_DAYS = 5    -- adults jobless this long -> household leaves
@@ -126,6 +125,10 @@ type Adult = {
 	driveKey: string?, parkEgress: { Vector3 }?, parkGraphPoint: Vector3?,
 	tripTargetId: string?, tripTargetHome: boolean,
 	commutedWorkDay: number, commutedHomeDay: number, nextErrandAt: number,
+	-- University (Trips.student): a high-school graduate of university age who chose to go
+	-- on studying (`wantsStudy`, stable per person) and the university they attend, if a
+	-- seat was found. Students go to classes instead of hunting for work.
+	wantsStudy: boolean?, studyId: number?, studyPos: Vector3?, commutedStudyDay: number?,
 }
 type Kid = {
 	name: string, gender: string, age: number, pid: number,
@@ -145,6 +148,7 @@ type Household = {
 	unservedFor: number?,
 	-- Game time (days) of this family's next shopping trip; set on first sight, not saved.
 	nextShopAt: number?,
+	nextLeisureAt: number?, -- game day of the family's next evening out (Trips.LEISURE_PER_WEEK)
 }
 
 local _households: { [number]: Household } = {}
@@ -167,12 +171,10 @@ local _reconciledIds: { [string]: boolean } = {}
 -- holds ids, not tables, so a household removed mid-sweep just resolves to nil and is
 -- skipped, and one created mid-sweep joins the next sweep -- no insertion or removal site
 -- has to know this exists.
--- CORRECTNESS CONSTRAINT: a full sweep must finish inside the narrowest commute window, or
--- an adult sleeps straight through their shift. That window is SHIFT/SCHOOL_WINDOW_HOURS
--- wide (1.25h); at Const.DAY_SECONDS 1440 that is 75 game-seconds, i.e. ~37 sim steps
--- at any speed. Keep sweeps well under it -- debugSnapshot reports `sweepSteps` and we warn
--- past SWEEP_WARN, so a city that outgrows the budget shows up instead of going silently
--- still.
+-- A slow sweep only makes people LATE now, never absent: trips are due from the state of
+-- a person's day (Trips.status), not from a short window at its start that a sweep could
+-- step over. Keep sweeps short all the same -- debugSnapshot reports `sweepSteps` and we
+-- warn past SWEEP_WARN -- because a late sweep is a late commute.
 local LOD: any = {
 	FRAME_BUDGET = 0.004, -- s of scheduler work per sim step
 	SWEEP_WARN   = 30,    -- sim steps per full sweep before we warn
@@ -977,14 +979,11 @@ local function makeKid(): Kid
 	}
 end
 
--- A kid's final education level on reaching adulthood: the highest school tier they enrolled
--- in, plus university (tier 3) if they finished high school and a university covers home.
-local function graduateEduLevel(kid: Kid, home: Vector3?): number
-	local level = kid.bestTier
-	if level >= 2 and typeof(home) == "Vector3" and _educationService and _educationService.coversTier then
-		if _educationService.coversTier(home, 3) then level = 3 end
-	end
-	return level
+-- A kid's education level on reaching adulthood: the highest school tier they enrolled in.
+-- A university degree (tier 3) is no longer handed out for living near one -- high-school
+-- graduates now go and study there (Trips.student) and graduate at Trips.UNI_MAX_AGE.
+local function graduateEduLevel(kid: Kid, _home: Vector3?): number
+	return kid.bestTier
 end
 
 -- A household can have children only with both a mother and a father present.
@@ -1713,6 +1712,7 @@ local function journey(h: Household, a: Adult, trip: number, fromDoor: Vector3?,
 	car:SetAttribute("TripPurpose", if a.tripTargetHome then "Returning home"
 		elseif a.outKind == "work" then "Commuting to assigned workplace"
 		elseif a.outKind == "shop" then "Shopping errand"
+		elseif a.outKind == "leisure" then "Evening out"
 		elseif a.outKind == "apply" then "Travelling to a job application"
 		else "Citizen trip")
 	-- Leg 1: walk from the door to the parked car.
@@ -1861,7 +1861,7 @@ local function startErrand(h: Household, a: Adult, kind: string, destId: string,
 	journey(h, a, trip, door(h.homeId), door(destId), true, function() return pickBuildingPark(h, destId) end, function()
 		if kind == "apply" then
 			applyForJob(h, a, destId, cap)
-		elseif kind == "shop" then
+		elseif kind == "shop" or kind == "leisure" then
 			doShopping(h, destId)
 		end
 		returnHome(h, a)
@@ -1934,8 +1934,6 @@ local function returnFromSchool(h: Household, k: Kid): boolean
 	return true
 end
 
-local SHIFT_WINDOW_HOURS = 1.25
-
 -- Where people go and why. One table, not locals (register limit, see LOD).
 --   Destinations follow the planners' gravity model: a place is chosen in proportion to
 --   1 / (distance + D0)^BETA, so the corner shop wins most trips and a store across the
@@ -1968,6 +1966,98 @@ function Trips.pickNear(ids: { string }, from: Vector3?, beta: number): string?
 		if roll <= 0 then return ids[i] end
 	end
 	return ids[#ids]
+end
+
+-- == When people set out: from where their day says they should be ==================
+-- A trip is due from the STATE of someone's day -- on shift, in school hours, in class --
+-- not from a short window at its start. The window version (SHIFT_WINDOW_HOURS, 75 game-
+-- seconds) sent a worker off only if the scheduler happened to look at them inside it and
+-- found them at home: anyone hired mid-morning, back from the shops a little late, or
+-- skipped by a slow sweep in a big city stayed home all day -- measured in the city lab,
+-- a quarter of the workforce was at home in the middle of its shift -- and one who missed
+-- the homeward window slept at work. Now a person at home during their shift goes (late, if
+-- need be, unless too little of it is left), and anyone still at work after it goes home.
+Trips.MIN_HOURS_LEFT = 2     -- not worth setting out for the last hours of a shift / school day
+Trips.CLASS_START = 9.5      -- university lectures (plus a per-person offset, like shifts)
+Trips.CLASS_END = 16.5
+Trips.UNI_MAX_AGE = 22       -- SchoolTypes University ageMax: graduation after this
+Trips.COLLEGE_SHARE = 0.7    -- of high-school graduates, the share who go on to university
+Trips.LEISURE_PER_WEEK = 3   -- evenings out per household per week
+Trips.LEISURE_FROM = 17.5    -- evening outings: restaurants, cinemas, the shops on the strip
+Trips.LEISURE_TO = 21.5
+Trips.LEISURE_BETA = 1.2     -- people go further for an evening out than for milk
+
+-- On a daily timetable [startHour, endHour) (endHour may run past 24)? Also: hours of it
+-- still to come, and the calendar day it started on (a night shift started yesterday).
+function Trips.status(startHour: number, endHour: number, hour: number, day: number): (boolean, number, number)
+	local s = startHour % 24
+	local since = (hour - s) % 24
+	local length = endHour - startHour
+	if since < length then
+		return true, length - since, if hour >= s then day else day - 1
+	end
+	return false, 0, day
+end
+
+-- Stable 0..1 per person and purpose (the same answer every time it is asked).
+function Trips.roll(pid: number, salt: number): number
+	return Random.new(pid * 32 + salt):NextNumber()
+end
+
+-- Studying at university right now (enrolled, and the university still takes them)? Finds a
+-- seat for a graduate who wants one; nil when there is no university within reach of home.
+function Trips.student(h: Household, a: Adult): boolean
+	if a.jobId or not a.wantsStudy or a.age > Trips.UNI_MAX_AGE or not _educationService then return false end
+	if a.studyId and _educationService.hasSchool and _educationService.hasSchool(a.studyId, a.age) then return true end
+	local home = door(h.homeId)
+	if not home or not _educationService.getNearestSchool then return false end
+	local pos, id = _educationService.getNearestSchool(home, a.age, nil)
+	if typeof(pos) ~= "Vector3" or typeof(id) ~= "number" then
+		a.studyId, a.studyPos = nil, nil
+		return false
+	end
+	a.studyId, a.studyPos = id, pos
+	return true
+end
+
+-- To lectures and back. On foot or by bus -- students here do not take the family car.
+function Trips.toClass(h: Household, a: Adult)
+	a.tripId += 1
+	local trip = a.tripId
+	if a.walkerId then _walkingService.despawnCommuter(a.walkerId); a.walkerId = nil end
+	if a.riderId then _transitService.cancelRider(a.riderId); a.riderId = nil; a.waitPos = nil end
+	a.stage = "transit"
+	a.outKind = "study"
+	a.outDestId = nil
+	a.tripTargetId = nil
+	a.tripTargetHome = false
+	local studyId = a.studyId
+	journey(h, a, trip, door(h.homeId), a.studyPos, false, nil, function()
+		if _educationService and _educationService.enterSchool then _educationService.enterSchool(studyId) end
+		a.stage = "atStudy"
+	end)
+end
+
+function Trips.fromClass(h: Household, a: Adult)
+	if _households[h.id] == nil then return end
+	a.tripId += 1
+	local trip = a.tripId
+	if a.walkerId then _walkingService.despawnCommuter(a.walkerId); a.walkerId = nil end
+	if a.riderId then _transitService.cancelRider(a.riderId); a.riderId = nil; a.waitPos = nil end
+	if a.stage == "atStudy" and _educationService and _educationService.leaveSchool then
+		_educationService.leaveSchool(a.studyId)
+	end
+	a.stage = "transit"
+	a.tripTargetId = h.homeId
+	a.tripTargetHome = true
+	journey(h, a, trip, a.studyPos, door(h.homeId), false, nil, function()
+		a.stage = "atHome"
+		a.outKind = nil
+		a.tripTargetId = nil
+		a.tripTargetHome = false
+		-- Graduated (or the university went) while in class: no longer a student.
+		if not a.wantsStudy then a.studyId, a.studyPos = nil, nil end
+	end)
 end
 
 function Trips.walk(h: Household, a: Adult): boolean
@@ -2004,15 +2094,6 @@ local function idHash(text: string): number
 	return n
 end
 
-local function inHourWindow(frac: number, startHour: number, endHour: number): boolean
-	local startFrac = (startHour % 24) / 24
-	local endFrac = (endHour % 24) / 24
-	if startFrac <= endFrac then
-		return frac >= startFrac and frac < endFrac
-	end
-	return frac >= startFrac or frac < endFrac
-end
-
 local function shiftHours(jobView: any): (number, number)
 	local hash = idHash(tostring(jobView.bpId or ""))
 	if jobView.zone == "Industrial" then
@@ -2032,28 +2113,6 @@ end
 
 local function schoolShiftOffsetHours(pid: number): number
 	return ((pid * 13) % 45) / 60
-end
-
-local function isShiftStart(jobView: any, householdId: number): boolean
-	local startHour = shiftHours(jobView)
-	local offset = householdShiftOffsetHours(householdId)
-	return inHourWindow(_timeService.getDayFraction(), startHour + offset, startHour + offset + SHIFT_WINDOW_HOURS)
-end
-
-local function isShiftEnd(jobView: any, householdId: number): boolean
-	local _, endHour = shiftHours(jobView)
-	local offset = householdShiftOffsetHours(householdId)
-	return inHourWindow(_timeService.getDayFraction(), endHour + offset, endHour + offset + SHIFT_WINDOW_HOURS)
-end
-
-local function isSchoolStart(k: Kid): boolean
-	local offset = schoolShiftOffsetHours(k.pid)
-	return inHourWindow(_timeService.getDayFraction(), SCHOOL_START_HOUR + offset, SCHOOL_START_HOUR + offset + SCHOOL_WINDOW_HOURS)
-end
-
-local function isSchoolEnd(k: Kid): boolean
-	local offset = schoolShiftOffsetHours(k.pid)
-	return inHourWindow(_timeService.getDayFraction(), SCHOOL_END_HOUR + offset, SCHOOL_END_HOUR + offset + SCHOOL_WINDOW_HOURS)
 end
 
 -- Educated adults (well/highly) prefer commercial/office work; everyone falls back to any
@@ -2078,8 +2137,6 @@ end
 -- be at two different buildings -- so the family car is claimed first-come (others walk).
 local function doActivities(views: { any }, byId: { [string]: any })
 	local day = _timeService.getDay()
-	local globalToWork = _timeService.isWorkboundWindow()
-	local globalToHome = _timeService.isHomeboundWindow()
 	local now = os.clock()
 	local hour = _timeService.getDayFraction() * 24
 	local gameNow = day + _timeService.getDayFraction() -- game days, for the shopping schedule
@@ -2096,7 +2153,7 @@ local function doActivities(views: { any }, byId: { [string]: any })
 		LOD.cursor = 1
 		LOD.lastSweepSteps = LOD.sweepSteps
 		if LOD.sweepSteps > LOD.SWEEP_WARN then
-			warn(string.format("[CitizenService] activity sweep took %d sim steps for %d households -- adults may miss shift windows; raise LOD.FRAME_BUDGET", LOD.sweepSteps, #LOD.order))
+			warn(string.format("[CitizenService] activity sweep took %d sim steps for %d households -- commutes run late; raise LOD.FRAME_BUDGET", LOD.sweepSteps, #LOD.order))
 		end
 		LOD.sweepSteps = 0
 	end
@@ -2125,10 +2182,12 @@ local function doActivities(views: { any }, byId: { [string]: any })
 				returnFromSchool(h, k)
 				continue
 			end
-			if k.stage == "atHome" and k.commutedSchoolDay ~= day and isSchoolStart(k) then
+			local soff = schoolShiftOffsetHours(k.pid)
+			local inSchool, schoolLeft = Trips.status(SCHOOL_START_HOUR + soff, SCHOOL_END_HOUR + soff, hour, day)
+			if k.stage == "atHome" and k.commutedSchoolDay ~= day and inSchool and schoolLeft >= Trips.MIN_HOURS_LEFT then
 				if startSchool(h, k) then k.commutedSchoolDay = day end
 				continue
-			elseif k.stage == "atSchool" and k.commutedHomeDay ~= day and isSchoolEnd(k) then
+			elseif k.stage == "atSchool" and not inSchool then
 				if returnFromSchool(h, k) then k.commutedHomeDay = day end
 				continue
 			end
@@ -2147,20 +2206,39 @@ local function doActivities(views: { any }, byId: { [string]: any })
 				continue
 			end
 
-			local toWork = if jobView then isShiftStart(jobView, h.id) else globalToWork
-			local toHome = if jobView then isShiftEnd(jobView, h.id) else globalToHome
-
-			-- Daily work commute for an employed adult.
-			if jobId then
-				if toWork and a.stage == "atHome" and a.commutedWorkDay ~= day then
-					a.commutedWorkDay = day
+			-- Daily work commute for an employed adult (Trips.status: from the state of the
+			-- day, so a late start still goes and nobody sleeps at work).
+			if jobId and jobView then
+				local startHour, endHour = shiftHours(jobView)
+				local off = householdShiftOffsetHours(h.id)
+				local onShift, left, shiftDay = Trips.status(startHour + off, endHour + off, hour, day)
+				if onShift and a.stage == "atHome" and a.commutedWorkDay ~= shiftDay and left >= Trips.MIN_HOURS_LEFT then
+					a.commutedWorkDay = shiftDay
 					startWork(h, a, jobId)
 					continue
-				elseif toHome and a.stage == "atWork" and a.commutedHomeDay ~= day then
+				elseif not onShift and a.stage == "atWork" then
 					a.commutedHomeDay = day
 					returnHome(h, a)
 					continue
 				end
+			end
+
+			-- University: lectures on the same state rule, and no job hunting while enrolled.
+			local student = Trips.student(h, a)
+			if student then
+				local off = schoolShiftOffsetHours(a.pid)
+				local inClass, left = Trips.status(Trips.CLASS_START + off, Trips.CLASS_END + off, hour, day)
+				if inClass and a.stage == "atHome" and a.commutedStudyDay ~= day and left >= Trips.MIN_HOURS_LEFT then
+					a.commutedStudyDay = day
+					Trips.toClass(h, a)
+					continue
+				elseif not inClass and a.stage == "atStudy" then
+					Trips.fromClass(h, a)
+					continue
+				end
+			elseif a.stage == "atStudy" then
+				Trips.fromClass(h, a) -- the university closed (or they graduated) mid-lecture
+				continue
 			end
 
 			-- Everything below acts only from home.
@@ -2169,7 +2247,7 @@ local function doActivities(views: { any }, byId: { [string]: any })
 			-- Job hunt: an unemployed adult heads to an opening to apply. A short randomised
 			-- stagger keeps a wave of arrivals from flooding the roads on the same step; the
 			-- transit state self-throttles each adult to one application trip at a time.
-			if not jobId and now >= a.nextErrandAt then
+			if not jobId and not student and now >= a.nextErrandAt then
 				cachedJobs = cachedJobs or openJobs(views)
 				if #cachedJobs > 0 then
 					local destId = pickJobFor(a, cachedJobs, byId, door(h.homeId))
@@ -2194,6 +2272,20 @@ local function doActivities(views: { any }, byId: { [string]: any })
 					h.nextShopAt = gameNow + shopGap * _rng:NextNumber(0.5, 1.5)
 					a.nextErrandAt = now + ERRAND_COOLDOWN
 					startErrand(h, a, "shop", destId, 0)
+					continue
+				end
+			end
+
+			-- An evening out: a restaurant, a film, the shops on the strip -- a few evenings
+			-- a week, whoever of the family is home and free, like the shopping schedule.
+			if not h.nextLeisureAt then h.nextLeisureAt = gameNow + _rng:NextNumber() * (7 / Trips.LEISURE_PER_WEEK) end
+			if hour >= Trips.LEISURE_FROM and hour < Trips.LEISURE_TO and gameNow >= (h.nextLeisureAt :: number) then
+				cachedStores = cachedStores or stores(views)
+				local destId = Trips.pickNear(cachedStores :: { string }, door(h.homeId), Trips.LEISURE_BETA)
+				if destId then
+					h.nextLeisureAt = gameNow + (7 / Trips.LEISURE_PER_WEEK) * _rng:NextNumber(0.5, 1.5)
+					a.nextErrandAt = now + ERRAND_COOLDOWN
+					startErrand(h, a, "leisure", destId, 0)
 					continue
 				end
 			end
@@ -2269,7 +2361,9 @@ local function dailyTick(byId: { [string]: any })
 		local anyJob = false
 		local allJoblessLong = #h.adults > 0
 		for _, a in h.adults do
-			if a.jobId then anyJob = true; a.joblessDays = 0 else a.joblessDays += 1 end
+			if a.jobId then anyJob = true; a.joblessDays = 0
+			elseif a.studyId then a.joblessDays = 0 -- studying, not out of work
+			else a.joblessDays += 1 end
 			if a.joblessDays < LEAVE_JOBLESS_DAYS then allJoblessLong = false end
 		end
 
@@ -2282,7 +2376,15 @@ local function dailyTick(byId: { [string]: any })
 		end
 
 		-- Everyone ages one step. Kids who reach adulthood become job-seeking adults.
-		for _, a in h.adults do a.age += AGE_PER_DAY end
+		for _, a in h.adults do
+			a.age += AGE_PER_DAY
+			-- Graduation: past university age, a student leaves with a degree and looks for work.
+			if a.wantsStudy and a.age > Trips.UNI_MAX_AGE then
+				if a.studyId then a.eduLevel = math.max(a.eduLevel, 3) end
+				a.wantsStudy = nil
+				if a.stage ~= "atStudy" then a.studyId, a.studyPos = nil, nil end
+			end
+		end
 		for i = #h.kids, 1, -1 do
 			local kid = h.kids[i]
 			kid.age += AGE_PER_DAY
@@ -2293,8 +2395,10 @@ local function dailyTick(byId: { [string]: any })
 				end
 				table.remove(h.kids, i)
 				LOD.pidGen += 1
+				local level = graduateEduLevel(kid, door(h.homeId))
 				table.insert(h.adults, {
-					name = kid.name, gender = kid.gender, age = kid.age, pid = kid.pid, eduLevel = graduateEduLevel(kid, door(h.homeId)), tripTargetId = nil, tripTargetHome = false,
+					name = kid.name, gender = kid.gender, age = kid.age, pid = kid.pid, eduLevel = level, tripTargetId = nil, tripTargetHome = false,
+					wantsStudy = level >= 2 and Trips.roll(kid.pid, 3) < Trips.COLLEGE_SHARE,
 					jobId = nil, joblessDays = 0,
 					stage = "atHome", tripId = 0, walkerId = nil,
 					outKind = nil, outDestId = nil, usingCar = false, ownsCar = TravelModeChoice.ownsCar(kid.pid),
@@ -2366,7 +2470,8 @@ local function pushWorkforceEducation(byId: { [string]: any })
 	for _, h in _households do
 		if h.arriving then continue end
 		for _, a in h.adults do
-			total += 1
+			-- Students are not in the labour force: they neither work nor count as jobless.
+			if not a.studyId then total += 1 end
 			local lvl = math.clamp(math.floor(tonumber(a.eduLevel) or 0), 0, 3)
 			if lvl == 0 then c0 += 1 elseif lvl == 1 then c1 += 1 elseif lvl == 2 then c2 += 1 else c3 += 1 end
 			if a.eduLevel >= 2 then educated += 1 end
@@ -3097,6 +3202,9 @@ function CitizenService.restore(data: any)
 					jobId = jobId,
 					joblessDays = math.max(0, math.floor(tonumber(a.joblessDays) or 0)), eduLevel = math.clamp(math.floor(tonumber(a.eduLevel) or 0), 0, 3),
 					stage = if atWork then "atWork" else "atHome",
+					-- Not saved: re-decided the way a new graduate decides (Trips.student).
+					wantsStudy = jobId == nil and (tonumber(a.eduLevel) or 0) == 2 and (tonumber(a.age) or 99) <= Trips.UNI_MAX_AGE
+						and Trips.roll(pid, 3) < Trips.COLLEGE_SHARE,
 					tripId = 0, walkerId = nil,
 					outKind = if atWork then "work" else nil,
 					outDestId = if atWork then jobId else nil,
@@ -3263,6 +3371,9 @@ function CitizenService.getAdminPersonDebug(pid: number): { [string]: any }?
 						elseif a.outKind == "shop" then "Shopping errand"
 						elseif a.outKind == "apply" then "Travelling to a job application"
 						elseif a.outKind == "walk" then "Out for a walk"
+						elseif a.outKind == "study" then "Going to university"
+						elseif a.outKind == "leisure" then "Evening out"
+						elseif a.stage == "atStudy" then "At university"
 						else "No active destination",
 					walkerId = a.walkerId,
 					car = if a.usingCar then a.car else nil,
@@ -3308,6 +3419,7 @@ function CitizenService.getPersonWhereabouts(pid: number): { pos: Vector3, statu
 						local root = a.car.PrimaryPart or a.car:FindFirstChildWhichIsA("BasePart")
 						local verb = if a.outKind == "shop" then "Driving to the shops"
 							elseif a.outKind == "apply" then "Driving to a job interview"
+							elseif a.outKind == "leisure" then "Driving out for the evening"
 							else "Driving to work"
 						if root then return { pos = root.Position, status = verb, follow = root } end
 					end
@@ -3317,6 +3429,8 @@ function CitizenService.getPersonWhereabouts(pid: number): { pos: Vector3, statu
 						local verb = if a.outKind == "shop" then "Walking to the shops"
 							elseif a.outKind == "apply" then "Walking to a job interview"
 							elseif a.outKind == "walk" then "Out for a walk"
+							elseif a.outKind == "study" then "Walking to university"
+							elseif a.outKind == "leisure" then "Out for the evening"
 							else "Walking to work"
 						if root then return { pos = root.Position, status = verb, follow = root } end
 					end
@@ -3327,6 +3441,9 @@ function CitizenService.getPersonWhereabouts(pid: number): { pos: Vector3, statu
 				if a.stage == "atWork" and a.outDestId then
 					local k = _buildingService.getKerb(a.outDestId)
 					if k then return { pos = k, status = "At work" } end
+				end
+				if a.stage == "atStudy" and typeof(a.studyPos) == "Vector3" then
+					return { pos = a.studyPos, status = "At university" }
 				end
 				local hk = homeFocusPosition(h.homeId)
 				if hk then return { pos = hk, status = "At home" } end

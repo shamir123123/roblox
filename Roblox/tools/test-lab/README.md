@@ -34,6 +34,7 @@ test every change before it ships.
 | `t_s10_lanes.luau <mode> <seconds> <seed>` | highway lane discipline: lane share, yields to faster cars behind, faster cars held up, braked lane changes |
 | `t_lights_toggle.luau` | junction control by road hierarchy, and the Traffic Light card: add / remove lights, survives save + load |
 | `t_signs.luau` | traffic sign plan (USA + Europe) on real junctions: which signs, off the carriageway, facing their traffic |
+| `t_city.luau <game days> [seed] [hourly]` | the REAL server (Bootstrap; lobby, teleport and terrain-render stubbed) on a sandbox town: homes, shops, industry, schools and a university, families arriving from the map edge. Hour by hour: are workers at work during their shift and home after it, pupils at school, students in class; trips by purpose. `THROUGH=1` adds through traffic |
 | `reg.sh <mode> <outdir>` | the whole traffic suite above, 4 at a time (needs `CITY_LAB_PLACE`; `CITY_LAB_GAME` to test a frozen copy) |
 | `render_lab.luau <mode> <scene> <out.json>` then `python3 render/top.py out.json out.png cx cz half ppu` | top-down picture of what the road code builds |
 | `DUMP3D="cx,cz,half" lune run render_lab.luau <mode> <scene> out.json` then `python3 render/shade3d.py out.3d.json out.png cx cy cz dist yaw pitch` | angled 3D picture (depth-buffered, PIL only) of the terrain plus everything the road code built -- e.g. scene `walls`: retaining walls on a raised road, a lowered road and a tunnel ramp with its portal |
