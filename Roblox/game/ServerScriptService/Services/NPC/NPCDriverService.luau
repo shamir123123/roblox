@@ -73,6 +73,10 @@ local BRAKE_RATE        = 60 * WS
 -- every car in it until the road clears -- or until the player rebuilds the road. Only a
 -- car the traffic rules cannot explain (see waitingInTraffic) counts as bugged, and only a
 -- bugged car is pushed through or removed.
+-- A car further than this from its stop line is not asked for right of way yet: whichever
+-- is longer, a fixed distance or this many seconds at its current speed.
+local JUNCTION_LOOKAHEAD_MIN  = 12 -- studs
+local JUNCTION_LOOKAHEAD_TIME = 1.5 -- s, the same horizon the yellow-light commit uses
 local IMPATIENCE_TIME   = 6    -- s a car waits for a gap at a junction before it noses out (never into a full exit or across a car in the box)
 local AT_LINE_DIST      = 2    -- studs short of its stop line a car counts as waiting at it
 -- Turn-taking at junctions WITHOUT signals: how long a car waits at its line before it may
@@ -123,6 +127,16 @@ local _connectorByNextEdgeIndex: { [string]: { any } } = {}
 local _laneChangeIndex: { [string]: { any } } = {}
 -- Cars crossing a junction (or a join), by the lane they left: see getNearestQueueLeader.
 local _connectorByFromEdgeIndex: { [string]: { any } } = {}
+-- Cars on a connector, by the node their landing lane starts at and by the node the lane
+-- they left ends at. The right-of-way checks ask "who is crossing THIS junction"; they used
+-- to walk every driver in the city for it, per waiting car, per tick -- quadratic in the
+-- fleet, and most of the server's traffic cost in a big city. A car that starts a connector
+-- mid-tick is added at once (startConnector), because two cars entering one box in the same
+-- tick must see each other; entries left stale by a car landing mid-tick are filtered out by
+-- the live checks each caller already makes.
+local EMPTY = table.freeze({})
+local _connByLandingNode: { [number]: { any } } = {}
+local _connByLeavingNode: { [number]: { any } } = {}
 local _edgeCongestion: { [string]: number } = {}
 local _lastCongestionUpdate = 0
 
@@ -192,6 +206,9 @@ type DriverState = PathFollower.FollowerState & {
 -- Route bookings are keyed by an integer that must be unique across LIVE trips, so a
 -- released token is never reused by an overlapping one.
 local _nextBookingToken = 0
+
+-- Drivers not yet placed in PathFollower's spatial grid (see IsPointClear).
+local _unseated: { [Model]: any } = setmetatable({}, { __mode = "k" }) :: any
 
 -- MEMORY LEAK FIX: We make _drivers a WEAK-KEYED table so that when an NPC model is 
 -- destroyed, its driver state is auto-garbage-collected, preventing a slow memory leak.
@@ -319,14 +336,25 @@ local function followGap(state: DriverState, lead: DriverState?): number
 	return math.max(FOLLOW_MIN_GAP, (state.halfLength or 0) + (lead.halfLength or 0) + FOLLOW_BUMPER)
 end
 
-local function clearDriverIndexes()
-	table.clear(_edgeDriverIndex)
-	table.clear(_connectorByNextEdgeIndex)
-	table.clear(_laneChangeIndex)
-	table.clear(_connectorByFromEdgeIndex)
+-- Buckets are emptied in place and reused: rebuilt every tick, fresh tables for every lane
+-- were most of the traffic sim's garbage. A graph rebuild drops them all (edge ids change).
+local _indexGraphVersion = -1
+local ALL_INDEXES = { _edgeDriverIndex, _connectorByNextEdgeIndex, _laneChangeIndex, _connectorByFromEdgeIndex,
+	_connByLandingNode, _connByLeavingNode }
+
+local function clearDriverIndexes(graphVersion: number)
+	local drop = graphVersion ~= _indexGraphVersion
+	_indexGraphVersion = graphVersion
+	for _, index in ALL_INDEXES do
+		if drop then
+			table.clear(index)
+		else
+			for _, bucket in index :: { [any]: { any } } do table.clear(bucket) end
+		end
+	end
 end
 
-local function addToIndex(index: { [string]: { any } }, key: string, state: DriverState)
+local function addToIndex(index: { [any]: { any } }, key: any, state: DriverState)
 	local bucket = index[key]
 	if not bucket then
 		bucket = {}
@@ -335,12 +363,22 @@ local function addToIndex(index: { [string]: { any } }, key: string, state: Driv
 	table.insert(bucket, state)
 end
 
+-- File a car that is on a connector under the junction nodes it is crossing.
+local function indexConnectorNodes(g: any, state: DriverState)
+	local nextEdge = state.nextEdgeId and g:GetEdge(state.nextEdgeId)
+	if nextEdge then addToIndex(_connByLandingNode, nextEdge.fromNode, state) end
+	local fromEdge = g:GetEdge(state.edgeId)
+	if fromEdge then addToIndex(_connByLeavingNode, fromEdge.toNode, state) end
+end
+
 local function rebuildDriverIndexes()
-	clearDriverIndexes()
+	local g = nav()
+	clearDriverIndexes(if g then g:Version() else -1)
 	for _, other in pairs(_drivers) do
 		if not other.model.Parent then continue end
 		if other.connector and other.nextEdgeId then
 			addToIndex(_connectorByNextEdgeIndex, other.nextEdgeId, other)
+			if g then indexConnectorNodes(g, other) end
 			local lc = laneChangeOf(other)
 			if lc then
 				addToIndex(_laneChangeIndex, lc.from, other)
@@ -748,56 +786,45 @@ local CROSS_CLEAR_RADIUS = 22
 -- box is yielded to; a permissive crossing turn yields to oncoming through/nearside.
 local function signalizedClear(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
 	local myPos = getStatePosition(state)
-	for _, other in pairs(_drivers) do
-		if other == state or not other.model.Parent then continue end
-
-		-- Other car is actively crossing this node right now (connector phase).
-		if other.connector and other.nextEdgeId then
-			local otherNextEdge = g:GetEdge(other.nextEdgeId)
-			if otherNextEdge and otherNextEdge.fromNode == nodeId then
-				if other.edgeId ~= edge.id then
-					local otherEdge = g:GetEdge(other.edgeId)
-					if otherEdge then
-						if isOpposite(myDir, otherEdge.toDir) then
-							-- Oncoming: only our crossing turn conflicts with their straight/nearside.
-							local otherMove = otherEdge.outMovement and otherEdge.outMovement[other.nextEdgeId] or "straight"
-							if myMove == crossingTurn() and otherMove ~= crossingTurn() then
-								return false
-							end
-						elseif (getStatePosition(other) - myPos).Magnitude < CROSS_CLEAR_RADIUS then
-							-- Perpendicular cross traffic clearing right in front of us:
-							-- yield. A car exiting the far side of a big box does not
-							-- hold our green.
-							return false
-						end
-					end
-				end
+	-- Other cars actively crossing this node right now (connector phase).
+	for _, other in _connByLandingNode[nodeId] or EMPTY do
+		if other == state or not other.model.Parent or not (other.connector and other.nextEdgeId) then continue end
+		local otherNextEdge = g:GetEdge(other.nextEdgeId)
+		if not otherNextEdge or otherNextEdge.fromNode ~= nodeId or other.edgeId == edge.id then continue end
+		local otherEdge = g:GetEdge(other.edgeId)
+		if not otherEdge then continue end
+		if isOpposite(myDir, otherEdge.toDir) then
+			-- Oncoming: only our crossing turn conflicts with their straight/nearside.
+			local otherMove = otherEdge.outMovement and otherEdge.outMovement[other.nextEdgeId] or "straight"
+			if myMove == crossingTurn() and otherMove ~= crossingTurn() then
+				return false
 			end
+		elseif (getStatePosition(other) - myPos).Magnitude < CROSS_CLEAR_RADIUS then
+			-- Perpendicular cross traffic clearing right in front of us: yield. A car
+			-- exiting the far side of a big box does not hold our green.
+			return false
 		end
+	end
 
-		-- Permissive crossing turn: give way to oncoming through/nearside traffic on green
-		-- AND is close enough to actually conflict (within 45 studs of stop line).
-		-- Guard: only apply when the oncoming car is still approaching (not connector),
-		-- otherwise a car that already committed and is inside the box keeps blocking us.
-		if myMove == crossingTurn() and not other.connector then
-			local otherEdge = g:GetEdge(other.edgeId)
-			if otherEdge and otherEdge.toNode == nodeId and isOpposite(myDir, otherEdge.toDir) then
-				local otherNext = other.pendingNextEdgeId
+	-- Permissive crossing turn: give way to oncoming through/nearside traffic on green that
+	-- is close enough to actually conflict (within 40 studs of its stop line). Only while
+	-- the oncoming car is still approaching: one already committed inside the box is above.
+	if myMove ~= crossingTurn() then return true end
+	for _, otherEdge in g._edgesByToNode[nodeId] or EMPTY do
+		if not isOpposite(myDir, otherEdge.toDir) then continue end
+		for _, other in _edgeDriverIndex[otherEdge.id] or EMPTY do
+			if other == state or other.connector or other.edgeId ~= otherEdge.id or not other.model.Parent then continue end
+			local otherNext = other.pendingNextEdgeId
 			local otherMove = "straight"
-				if otherNext then
-					otherMove = otherEdge.outMovement and otherEdge.outMovement[otherNext] or "straight"
-				end
-				if otherMove ~= crossingTurn() and TrafficSignalService.CanGo(other.edgeId, otherNext) then
-					local cum = PathFollower.getCum(otherEdge)
-					local total = cum and cum[#cum] or 0
-					local gap = getStopLineGap(g, nodeId, otherEdge)
-					local stopLine = total - gap
-					local distToStop = stopLine - other.edgeDist
-					-- Only yield if the oncoming car is within 40 studs of the stop line
-					-- (approaching) but not already past it (committed inside the box).
-					if distToStop > 0 and distToStop < 40 then
-						return false
-					end
+			if otherNext then
+				otherMove = otherEdge.outMovement and otherEdge.outMovement[otherNext] or "straight"
+			end
+			if otherMove ~= crossingTurn() and TrafficSignalService.CanGo(other.edgeId, otherNext) then
+				local cum = PathFollower.getCum(otherEdge)
+				local total = cum and cum[#cum] or 0
+				local distToStop = total - getStopLineGap(g, nodeId, otherEdge) - other.edgeDist
+				if distToStop > 0 and distToStop < 40 then
+					return false
 				end
 			end
 		end
@@ -838,54 +865,49 @@ local function unsignalizedClear(g: any, state: DriverState, edge: any, nodeId: 
 	local myPriority = getArmPriority(g, nodeId, edge.id)
 	local myPos = getStatePosition(state)
 
-	for _, other in pairs(_drivers) do
-		if other == state or not other.model.Parent then continue end
-
-		-- Cars crossing the node now.
-		if other.connector and other.nextEdgeId then
-			local otherNextEdge = g:GetEdge(other.nextEdgeId)
-			if otherNextEdge and otherNextEdge.fromNode == nodeId and other.edgeId ~= edge.id then
-				local otherEdge = g:GetEdge(other.edgeId)
-				if otherEdge then
-					if isOpposite(myDir, otherEdge.toDir) then
-						local otherMove = otherEdge.outMovement and otherEdge.outMovement[other.nextEdgeId] or "straight"
-						if myMove == crossingTurn() and otherMove ~= crossingTurn() then return false end
-					elseif (getStatePosition(other) - myPos).Magnitude < CROSS_CLEAR_RADIUS then
-						return false -- perpendicular crossing traffic right in front of us
-					end
-				end
-			end
+	-- Cars crossing the node now.
+	for _, other in _connByLandingNode[nodeId] or EMPTY do
+		if other == state or not other.model.Parent or not (other.connector and other.nextEdgeId) then continue end
+		local otherNextEdge = g:GetEdge(other.nextEdgeId)
+		if not otherNextEdge or otherNextEdge.fromNode ~= nodeId or other.edgeId == edge.id then continue end
+		local otherEdge = g:GetEdge(other.edgeId)
+		if not otherEdge then continue end
+		if isOpposite(myDir, otherEdge.toDir) then
+			local otherMove = otherEdge.outMovement and otherEdge.outMovement[other.nextEdgeId] or "straight"
+			if myMove == crossingTurn() and otherMove ~= crossingTurn() then return false end
+		elseif (getStatePosition(other) - myPos).Magnitude < CROSS_CLEAR_RADIUS then
+			return false -- perpendicular crossing traffic right in front of us
 		end
+	end
 
-		-- Approaching cars near the line.
-		if not other.connector then
-			local otherEdge = g:GetEdge(other.edgeId)
-			if otherEdge and otherEdge.toNode == nodeId and otherEdge.id ~= edge.id then
-				if etaToStopLine(g, other, otherEdge, nodeId) < CROSS_GAP_TIME then
-					if isOpposite(myDir, otherEdge.toDir) then
-						-- Oncoming: only our crossing turn yields to their straight/nearside.
-						if myMove == crossingTurn() then
-							local otherNext = other.pendingNextEdgeId
-							local otherMove = "straight"
-							if otherNext then
-								otherMove = otherEdge.outMovement and otherEdge.outMovement[otherNext] or "straight"
-							end
-							if otherMove ~= crossingTurn() then return false end
-						end
-					else
-						-- Cross traffic.
-						local otherPriority = getArmPriority(g, nodeId, otherEdge.id)
-						if myPriority == "minor" and otherPriority == "major" then
-							return false
-						elseif myPriority == otherPriority then
-							-- Left-before-right: yield to equal-priority cross traffic approaching from
-							-- our left. Anti-symmetric, so exactly one of a pair yields (the
-							-- impatience escape above breaks any 4-way circular wait).
-							local leftX, leftZ = myDir.Z, -myDir.X
-							if (-otherEdge.toDir.X) * leftX + (-otherEdge.toDir.Z) * leftZ > 0 then
-								return false
-							end
-						end
+	-- Approaching cars near the line.
+	for _, otherEdge in g._edgesByToNode[nodeId] or EMPTY do
+		if otherEdge.id == edge.id then continue end
+		for _, other in _edgeDriverIndex[otherEdge.id] or EMPTY do
+			if other == state or other.connector or other.edgeId ~= otherEdge.id or not other.model.Parent then continue end
+			if etaToStopLine(g, other, otherEdge, nodeId) >= CROSS_GAP_TIME then continue end
+			if isOpposite(myDir, otherEdge.toDir) then
+				-- Oncoming: only our crossing turn yields to their straight/nearside.
+				if myMove == crossingTurn() then
+					local otherNext = other.pendingNextEdgeId
+					local otherMove = "straight"
+					if otherNext then
+						otherMove = otherEdge.outMovement and otherEdge.outMovement[otherNext] or "straight"
+					end
+					if otherMove ~= crossingTurn() then return false end
+				end
+			else
+				-- Cross traffic.
+				local otherPriority = getArmPriority(g, nodeId, otherEdge.id)
+				if myPriority == "minor" and otherPriority == "major" then
+					return false
+				elseif myPriority == otherPriority then
+					-- Left-before-right: yield to equal-priority cross traffic approaching from
+					-- our left. Anti-symmetric, so exactly one of a pair yields (the
+					-- impatience escape above breaks any 4-way circular wait).
+					local leftX, leftZ = myDir.Z, -myDir.X
+					if (-otherEdge.toDir.X) * leftX + (-otherEdge.toDir.Z) * leftZ > 0 then
+						return false
 					end
 				end
 			end
@@ -900,23 +922,28 @@ end
 -- our entry (within ROUNDABOUT_YIELD_DIST), or one mid-crossing onto a ring arc
 -- leaving our node.
 local function roundaboutClear(g: any, state: DriverState, nodeId: number, nodePos: Vector3): boolean
-	for _, other in pairs(_drivers) do
-		if other == state or not other.model.Parent then continue end
+	-- A car crossing our node onto the ring, or one that has just reached our node on a ring
+	-- arc, is circulating through -- give way.
+	for _, other in _connByLandingNode[nodeId] or EMPTY do
+		if other == state or not other.connector or not other.model.Parent then continue end
+		local nextE = other.nextEdgeId and g:GetEdge(other.nextEdgeId)
+		if nextE and nextE.isRoundabout and nextE.fromNode == nodeId and g:GetEdge(other.edgeId) then
+			return false
+		end
+	end
+	for _, other in _connByLeavingNode[nodeId] or EMPTY do
+		if other == state or not other.connector or not other.model.Parent then continue end
 		local otherEdge = g:GetEdge(other.edgeId)
-		if not otherEdge then continue end
-		if other.connector then
-			-- A car crossing our node onto the ring, or one that has just reached our
-			-- node on a ring arc, is circulating through -- give way.
-			local nextE = other.nextEdgeId and g:GetEdge(other.nextEdgeId)
-			if nextE and nextE.isRoundabout and nextE.fromNode == nodeId then
-				return false
-			end
-			if otherEdge.isRoundabout and otherEdge.toNode == nodeId then
-				return false
-			end
-		elseif otherEdge.isRoundabout and otherEdge.toNode == nodeId then
-			-- A circulating car on the arc heading into our node, close enough to
-			-- conflict. Euclidean distance to the node is robust (no cum lookup).
+		if otherEdge and otherEdge.isRoundabout and otherEdge.toNode == nodeId then
+			return false
+		end
+	end
+	-- A circulating car on an arc heading into our node, close enough to conflict. Euclidean
+	-- distance to the node is robust (no cum lookup).
+	for _, inEdge in g._edgesByToNode[nodeId] or EMPTY do
+		if not inEdge.isRoundabout then continue end
+		for _, other in _edgeDriverIndex[inEdge.id] or EMPTY do
+			if other == state or other.connector or other.edgeId ~= inEdge.id or not other.model.Parent then continue end
 			if (getStatePosition(other) - nodePos).Magnitude < ROUNDABOUT_YIELD_DIST then
 				return false
 			end
@@ -951,7 +978,7 @@ local function distToStopLine(g: any, other: DriverState, otherEdge: any, nodeId
 end
 
 local function boxHasConflict(g: any, state: DriverState, edge: any, nodeId: number, myDir: Vector3, myMove: string): boolean
-	for _, other in pairs(_drivers) do
+	for _, other in _connByLandingNode[nodeId] or EMPTY do
 		if other == state or not other.connector or not other.nextEdgeId or not other.model.Parent then continue end
 		local otherNext = g:GetEdge(other.nextEdgeId)
 		if not otherNext or otherNext.fromNode ~= nodeId then continue end
@@ -1246,6 +1273,8 @@ local function startConnector(
 	state.nextEdgeId   = nextId
 	state.nextEdgeDist = resumeDist
 	state.pendingNextEdgeId = nil
+	local g = nav()
+	if g then indexConnectorNodes(g, state) end
 end
 
 local function buildUTurnArc(fromEdge: any, toEdge: any): { Vector3 }
@@ -1611,7 +1640,33 @@ end
 -- Nearest car ahead in this car's lane, and the gap to it. On a connector "this lane" is the
 -- one it lands on, so a queue runs unbroken through joins, turns and lane changes: cars
 -- crossing into the lane and cars mid lane change out of it are in the way at their lanePos.
+local findQueueLeader: (state: DriverState) -> (DriverState?, number?)
+
+-- One car's update asks this up to five times (reroute, lane change, spacing, speed, the
+-- watchdog) and nothing else moves in between, so the answer is kept for as long as the
+-- asking car has not moved or changed lane. _queueEpoch changes before every car's update.
+local _queueEpoch = 0
+type QueueMemo = { epoch: number, edgeId: string, edgeDist: number, connDist: number, conn: boolean, lead: DriverState?, gap: number? }
+local _queueMemo: { [DriverState]: QueueMemo } = setmetatable({}, { __mode = "k" }) :: any
 local function getNearestQueueLeader(state: DriverState): (DriverState?, number?)
+	local memo = _queueMemo[state]
+	local onConn = state.connector ~= nil
+	if memo and memo.epoch == _queueEpoch and memo.edgeId == state.edgeId and memo.edgeDist == state.edgeDist
+		and memo.conn == onConn and memo.connDist == state.connDist then
+		return memo.lead, memo.gap
+	end
+	local lead, gap = findQueueLeader(state)
+	if not memo then
+		memo = {} :: any
+		_queueMemo[state] = memo :: QueueMemo
+	end
+	local m = memo :: QueueMemo
+	m.epoch, m.edgeId, m.edgeDist, m.connDist, m.conn, m.lead, m.gap =
+		_queueEpoch, state.edgeId, state.edgeDist, state.connDist, onConn, lead, gap
+	return lead, gap
+end
+
+function findQueueLeader(state: DriverState): (DriverState?, number?)
 	local laneId = if state.connector then state.nextEdgeId else state.edgeId
 	if not laneId then return nil, nil end
 	local myPos = lanePos(state, laneId)
@@ -2076,6 +2131,8 @@ end
 local function updateDriver(state: DriverState, dt: number)
 	local g = nav()
 	if not g or not state.model.Parent then return end
+	-- Everything else stands still while this car updates (see getNearestQueueLeader).
+	_queueEpoch += 1
 
 	local currentVersion = g:Version()
 	if state.graphVersion ~= currentVersion then
@@ -2210,7 +2267,10 @@ local function updateDriver(state: DriverState, dt: number)
 		local safeStoppingDistance = currentSpeed * 1.5
 		local committed = (state.edgeDist > stopDist + 0.1) or (isYellow and distToStop < safeStoppingDistance)
 
-		if nextId and not committed then
+		-- Right of way is asked only of a car that could reach its line soon. Every car on
+		-- every lane used to ask every tick, however far back in the block it was, and each
+		-- ask walks the junction -- the answer is only ever used near the line.
+		if nextId and not committed and distToStop <= math.max(JUNCTION_LOOKAHEAD_MIN, currentSpeed * JUNCTION_LOOKAHEAD_TIME) then
 			local chosenNextId, canEnter = chooseEnterableNextEdgeId(g, state, edge, nextId)
 			nextId = chosenNextId
 			if not canEnter then
@@ -2525,7 +2585,8 @@ local function updateDriver(state: DriverState, dt: number)
 		local committed = (state.edgeDist > stopDistVal + 0.1) or (isYellow and distToStopVal < safeStoppingDistance)
 
 		local loopMustStop = false
-		if nextId and not committed then
+		-- Only a step that would carry the car over its line needs the answer (see above).
+		if nextId and not committed and distToStopVal <= remaining + 1 then
 			local chosenNextId, canEnter = chooseEnterableNextEdgeId(g, state, currentEdge, nextId)
 			nextId = chosenNextId
 			if not canEnter then
@@ -2767,6 +2828,7 @@ local function trySpawn(): boolean
 			replicateAccum = 0,
 		}
 		_drivers[car] = state
+		_unseated[car] = state
 
 		local cum: { number } = table.create(#pts, 0)
 		cum[1] = 0
@@ -2875,6 +2937,7 @@ function NPCDriverService.DriveDirected(model: Model, startPos: Vector3, goalPos
 		lastTrafficAbandonedNextEdgeId = nil,
 	}
 	_drivers[model] = state
+	_unseated[model] = state
 	-- Stake this route out so every driver planning after us can see it is taken.
 	bookRoute(state)
 	tagCarInfo(state, "Directed", route[1])
@@ -3078,14 +3141,22 @@ function NPCDriverService.CountCityCarsOnHighways(): number
 end
 
 function NPCDriverService.IsPointClear(pos: Vector3, radius: number): boolean
+	-- A driving vehicle is in PathFollower's spatial grid at its live pose from its first
+	-- step, so only the cells around `pos` are looked at (this was a scan of the whole fleet
+	-- per spawn try). One handed over since then is still where it was put down.
 	local r2 = radius * radius
-	for model, state in _drivers do
-		if not model.Parent then continue end
+	for model, state in _unseated do
+		if not model.Parent or _drivers[model] ~= state or PathFollower.isRegistered(model) then
+			_unseated[model] = nil
+			continue
+		end
 		local p = getStatePosition(state)
 		local dx, dz = p.X - pos.X, p.Z - pos.Z
 		if dx * dx + dz * dz < r2 then return false end
 	end
-	return true
+	return not PathFollower.anyVehicleWithin(pos, radius, function(model: Model): boolean
+		return _drivers[model] ~= nil
+	end)
 end
 
 -- The gap a driver waits for before pulling out of a driveway or turning across the

@@ -310,8 +310,12 @@ local _camReportAccum     = 0
 local _lastReportedPos: Vector3? = nil
 local _lastReportedYaw: number? = nil
 local _lastReportedPitch: number? = nil
-local CAM_MOVE_THRESHOLD  = 5
-local CAM_ANGLE_THRESHOLD = 3
+-- Fine thresholds: the server streams traffic by where the camera looks at the GROUND, and
+-- from a high city camera a 3 degree tilt moves that point hundreds of studs -- so the server
+-- was sending full-rate poses to a street off to one side of the one on screen. Still at
+-- most one report per CAM_REPORT_INTERVAL.
+local CAM_MOVE_THRESHOLD  = 2
+local CAM_ANGLE_THRESHOLD = 0.5
 
 local function cameraAngles(cf: CFrame): (number, number)
 	local dir = cf.LookVector

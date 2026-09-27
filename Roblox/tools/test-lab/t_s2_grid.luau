@@ -18,7 +18,7 @@ for i = 0, N - 1 do
 	end
 end
 w:build(signals)
-w:camera(V.new(300, 0, 300))
+w:camera(if process.env.CAMERA_FAR then V.new(6000, 0, 6000) else V.new(300, 0, 300))
 local m = Metrics.new(w)
 m.log = process.args[6] == "log"
 local rng = w.Studio.Random.new(seed)

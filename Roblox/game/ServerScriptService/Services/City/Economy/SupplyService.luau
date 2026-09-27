@@ -511,10 +511,18 @@ end
 local TRADE_EDGE_OFFSET = 24
 
 local function edgePoint(g: any, conn: any, inbound: boolean): Vector3?
-	local aim = if inbound then conn.outer - conn.normal * 200 else conn.outer + conn.normal * 200
-	local res = g:NearestEdgeToward(conn.outer, aim)
-	if not (res and res.edge and res.edge.points and #res.edge.points >= 2) then return nil end
-	local pts = res.edge.points
+	-- Arrivals spread over every lane into the city (as through traffic does); a truck leaving
+	-- may finish in any lane of the exit road (the router allows it), so one lane is enough.
+	local lanes = if inbound and g.GetOutgoingEdgesFromNode and typeof(conn.nodeId) == "number"
+		then g:GetOutgoingEdgesFromNode(conn.nodeId) else {}
+	local edge = if #lanes > 0 then lanes[math.random(1, #lanes)] else nil
+	if not edge then
+		local aim = if inbound then conn.outer - conn.normal * 200 else conn.outer + conn.normal * 200
+		local res = g:NearestEdgeToward(conn.outer, aim)
+		edge = res and res.edge
+	end
+	if not (edge and edge.points and #edge.points >= 2) then return nil end
+	local pts = edge.points
 	local acc = 0
 	if inbound then
 		for i = 2, #pts do

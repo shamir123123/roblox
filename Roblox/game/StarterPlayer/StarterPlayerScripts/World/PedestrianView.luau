@@ -211,7 +211,10 @@ local function onStreamPacket(buf: buffer)
 		t.streamAt = _clock
 		local pos = Vector3.new(buffer.readf32(buf, off + 4), buffer.readf32(buf, off + 8), buffer.readf32(buf, off + 12))
 		local yaw = buffer.readu16(buf, off + 16) / 65535 * (2 * math.pi) - math.pi
-		local pitch = math.rad(buffer.readi8(buf, off + 18))
+		-- -128 marks a walker's last pose before it leaves our stream (PathFollower); walkers
+		-- stand upright, so it simply reads as level.
+		local pitchRaw = buffer.readi8(buf, off + 18)
+		local pitch = if pitchRaw == -128 then 0 else math.rad(pitchRaw)
 		local cosP = math.cos(pitch)
 		local look = Vector3.new(-math.sin(yaw) * cosP, math.sin(pitch), -math.cos(yaw) * cosP)
 		local pose = CFrame.lookAt(pos, pos + look, Vector3.yAxis)

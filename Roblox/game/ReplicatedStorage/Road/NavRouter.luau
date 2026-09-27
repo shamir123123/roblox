@@ -33,6 +33,9 @@ local LANE_CHANGE_SECONDS = 3
 -- one: a left turn plus the gap you wait for. US law allows it across dashed and double
 -- yellow centre lines alike (CVC 21460(b)); never across a median.
 local CROSS_CENTRE_SECONDS = 10
+-- Free-flow times a lane's congestion above its road's mean adds: a lane fully queued (1.0)
+-- beside empty ones crawls at about a third of the limit (NAV_CONGESTION_JAM_SPEED_RATIO).
+local LANE_QUEUE_WEIGHT = 2
 
 local function flatUnit(v: Vector3): Vector3?
 	local flat = Vector3.new(v.X, 0, v.Z)
@@ -145,9 +148,18 @@ end
 local function edgeRouteCost(graph: any, edge: any, distance: number?, profile: Profile?): number
 	local length = distance or edge.length
 	local seconds = NavCost.freeFlowSeconds(edge, distance)
+	local jamAversion = if profile then profile.jamAversion else 1
 
-	-- Observed congestion, scaled by how much this driver cares about traffic.
-	local demand = graph:GetEdgeCongestion(edge.id) * (if profile then profile.jamAversion else 1)
+	-- Observed congestion, scaled by how much this driver cares about traffic. The ROAD's
+	-- (the mean over its lanes) goes through BPR with the bookings; this lane's own queue is
+	-- priced separately below. Through BPR per lane, bookings put the road on the steep part
+	-- of the curve and a 0.02 difference between two lanes came out at several seconds --
+	-- more than a lane change -- so through cars weaved from lane to lane the length of every
+	-- long road, each move a car stopped waiting for a gap.
+	local laneCongestion = graph:GetEdgeCongestion(edge.id)
+	local roadCongestion = if graph.GetRoadCongestion then graph:GetRoadCongestion(edge.id) else laneCongestion
+	local laneExcess = laneCongestion - roadCongestion
+	local demand = roadCongestion * jamAversion
 
 	-- Intent already committed by OTHER drivers, scaled by how far ahead this one reads.
 	local booked = graph:GetEdgeBookingPressure(edge.id, if profile then profile.token else nil)
@@ -160,6 +172,13 @@ local function edgeRouteCost(graph: any, edge: any, distance: number?, profile: 
 	if demand > 0 then
 		slowdown = NavCost.bprFactor(demand)
 		seconds *= slowdown
+	end
+	-- A queue in THIS lane (a turn lane backed up past the others): the time it adds over
+	-- the lanes beside it, roughly its share of the road crawling at jam speed. Negative for
+	-- the emptier lane, never below free flow.
+	if laneExcess ~= 0 then
+		seconds = math.max(NavCost.freeFlowSeconds(edge, distance),
+			seconds + laneExcess * LANE_QUEUE_WEIGHT * jamAversion * NavCost.freeFlowSeconds(edge, distance))
 	end
 
 	-- FUEL. Priced at the speed actually ACHIEVED (posted limit divided by the BPR
@@ -311,6 +330,30 @@ local function endpointsNear(graph: any, nearest: any, pos: Vector3, allowCrossi
 	return list
 end
 
+-- A trip that ends where a road runs off the map is LEAVING the city, and may leave by any
+-- lane of that carriageway. Tied to the one lane nearest the connection's centre point, every
+-- car in the other lanes had to merge into it just before the edge, so a wide exit carried
+-- all its traffic down one lane. Only when the goal sits on the last stretch of the lane: a
+-- building on a road that happens to lead off the map still gets its kerbside lane.
+local MAP_EXIT_GOAL_RANGE = 80
+
+local function addMapExitLanes(graph: any, goals: { [string]: Endpoint }, nearest: any, pos: Vector3, allows: (any) -> boolean)
+	local edge = nearest.edge
+	if not graph.LeavesMap or not graph:LeavesMap(edge) then
+		return
+	end
+	if edge.length - distanceAtIndex(edge.points, nearest.index) > MAP_EXIT_GOAL_RANGE then
+		return
+	end
+	for _, id in graph._edgesBySegment[edge.segmentId] or {} do
+		local lane = graph._edges[id]
+		if lane and not goals[id] and lane.forward == edge.forward and allows(lane) then
+			local index = nearestIndex(lane, pos)
+			goals[id] = { edge = lane, index = index, dist = distanceAtIndex(lane.points, index), extra = 0 }
+		end
+	end
+end
+
 -- Cost from `fromDist` along an edge to its far end, including the junction wait there.
 local function tailCost(graph: any, edge: any, fromDist: number, profile: Profile?): number
 	if fromDist <= 0 then
@@ -346,6 +389,7 @@ function NavRouter.findPath(graph: any, startPos: Vector3, goalPos: Vector3, all
 	for _, goal in endpointsNear(graph, goalNearest, goalPos, allowCrossing == true, allows) do
 		goals[goal.edge.id] = goal
 	end
+	addMapExitLanes(graph, goals, goalNearest, goalPos, allows)
 	local goalAnchor = goalNearest.edge.points[goalNearest.index]
 	local laneChangeLength = graph.LANE_CHANGE_MIN_LENGTH or 14
 	-- Heap priority: a lower bound on any finish through `edge`. That is the cost at the point

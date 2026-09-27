@@ -82,6 +82,13 @@ local _poseOf: { [Model]: CFrame } = setmetatable({}, { __mode = "k" }) :: any
 local _movedAt: { [Model]: number } = setmetatable({}, { __mode = "k" }) :: any
 local _streamKeep: { boolean } = {}
 local _nextKeepalive = 0
+-- A car that stops between two of a far viewer's poses was drawn where that viewer last saw
+-- it -- up to a braking distance short of where it stopped -- until the keepalive came round,
+-- while the car queuing behind it arrived on its next pose: the pair drew one inside the
+-- other. Its resting pose now goes out as soon as it has been still for a step or so.
+-- model -> os.clock after which, still unmoved, it counts as at rest.
+local _restDue: { [Model]: number } = setmetatable({}, { __mode = "k" }) :: any
+local REST_STEPS = 1.5 -- sim steps of no movement that mean "stopped" (one step can be a hold at a line)
 
 local _cameraPos: { [Player]: Vector3 } = {}
 -- Where each player's camera looks at the ground. A city camera hangs high and tilted, so the
@@ -140,6 +147,7 @@ function PathFollower.forget(model: Model)
 	_carHalf[model] = nil
 	_poseOf[model] = nil
 	_movedAt[model] = nil
+	_restDue[model] = nil
 end
 
 -- True when at least one player/camera is close enough that this car is being
@@ -332,6 +340,34 @@ function PathFollower.anyCarApproaching(pos: Vector3, radius: number): boolean
 	return false
 end
 
+function PathFollower.isRegistered(model: Model): boolean
+	return _carRegistry[model] ~= nil
+end
+
+-- True when a registered vehicle that `accept` agrees to stands within `radius` of `pos`.
+function PathFollower.anyVehicleWithin(pos: Vector3, radius: number, accept: (Model) -> boolean): boolean
+	local rSq = radius * radius
+	local minCellX = math.floor((pos.X - radius) / SPATIAL_CELL_SIZE)
+	local maxCellX = math.floor((pos.X + radius) / SPATIAL_CELL_SIZE)
+	local minCellZ = math.floor((pos.Z - radius) / SPATIAL_CELL_SIZE)
+	local maxCellZ = math.floor((pos.Z + radius) / SPATIAL_CELL_SIZE)
+	for cellX = minCellX, maxCellX do
+		local column = _spatial[cellX]
+		if not column then continue end
+		for cellZ = minCellZ, maxCellZ do
+			local bucket = column[cellZ]
+			if not bucket then continue end
+			for model in bucket do
+				local entry = _carRegistry[model]
+				if not entry or not model.Parent then continue end
+				local dx, dz = entry.pos.X - pos.X, entry.pos.Z - pos.Z
+				if dx * dx + dz * dz < rSq and accept(model) then return true end
+			end
+		end
+	end
+	return false
+end
+
 -- ── NPC pose stream ───────────────────────────────────────────────────────────
 -- NPC motion leaves the server as ONE batched unreliable packet per frame instead
 -- of per-model CFrame property writes: no replication-engine bookkeeping per part,
@@ -408,6 +444,15 @@ end
 
 local _refs: { Vector3 } = {}
 local _picks: { number } = {}
+-- Parallel to _picks: true for a vehicle's LAST pose to this viewer before it leaves their
+-- stream. Sent as pitch FAREWELL_PITCH (real pitches are clamped to +/-89), so the client
+-- hides exactly the vehicles the server stopped sending instead of guessing from its own
+-- camera -- whose idea of "past 1000 studs" drifted from the server's (the camera report is
+-- coarse), and a car the client still drew but the server no longer sent sat frozen while
+-- the traffic behind it drove straight through it.
+local _pickFarewell: { boolean } = {}
+local FAREWELL_PITCH = -128
+PathFollower.FAREWELL_PITCH = FAREWELL_PITCH
 
 local function sendPicks(player: Player, stamp: number)
 	local total = #_picks
@@ -428,7 +473,8 @@ local function sendPicks(player: Player, stamp: number)
 			buffer.writef32(buf, off + 12, pos.Z)
 			local yaw = math.atan2(-lv.X, -lv.Z)
 			buffer.writeu16(buf, off + 16, math.floor((yaw + math.pi) / (2 * math.pi) * 65535 + 0.5) % 65536)
-			buffer.writei8(buf, off + 18, math.clamp(math.floor(math.deg(math.asin(math.clamp(lv.Y, -1, 1))) + 0.5), -89, 89))
+			buffer.writei8(buf, off + 18, if _pickFarewell[k] then FAREWELL_PITCH
+				else math.clamp(math.floor(math.deg(math.asin(math.clamp(lv.Y, -1, 1))) + 0.5), -89, 89))
 			off += STREAM_ENTRY
 		end
 		Networker.SyncNpcPoses:FireClient(player, buf)
@@ -450,6 +496,7 @@ local function flushStream()
 			_lastSentTo[player] = sent
 		end
 		table.clear(_picks)
+		table.clear(_pickFarewell)
 		for j = 1, n do
 			local model = _streamModels[j]
 			local id = _npcIds[model] or 0
@@ -469,13 +516,15 @@ local function flushStream()
 				if due then
 					sent[id] = stamp
 					table.insert(_picks, j)
+					_pickFarewell[#_picks] = false
 				end
 			elseif sent[id] then
 				-- Leaving this viewer's stream: one last pose, so their copy moves to where the
-				-- vehicle really is and their view culls it there. Without it the car froze
+				-- vehicle really is and their view hides it there. Without it the car froze
 				-- where they last saw it, drawn on top of whatever queued there later.
 				sent[id] = nil
 				table.insert(_picks, j)
+				_pickFarewell[#_picks] = true
 			end
 		end
 		if #_picks > 0 then sendPicks(player, stamp) end
@@ -526,24 +575,33 @@ function PathFollower.streamPose(model: Model, cf: CFrame)
 	end
 end
 
--- Re-offer every stopped streamed model's resting pose (see KEEPALIVE_DT). Call every server
--- tick; it paces itself.
-function PathFollower.keepalive()
-	local now = os.clock()
-	if now < _nextKeepalive then return end
-	_nextKeepalive = now + KEEPALIVE_DT
-	local queued = false
-	for model, cf in _poseOf do
-		if model.Parent and _npcIds[model] and now - (_movedAt[model] or 0) >= KEEPALIVE_DT then
-			table.insert(_streamModels, model)
-			table.insert(_streamPoses, cf)
-			table.insert(_streamKeep, true)
-			queued = true
-		end
-	end
-	if queued and not _flushScheduled then
+local function queueKeep(model: Model, cf: CFrame)
+	table.insert(_streamModels, model)
+	table.insert(_streamPoses, cf)
+	table.insert(_streamKeep, true)
+	if not _flushScheduled then
 		_flushScheduled = true
 		task.defer(flushStream)
+	end
+end
+
+-- Offer the resting pose of every vehicle that has just stopped (see _restDue), and re-offer
+-- every stopped streamed model's pose (see KEEPALIVE_DT). Call every server tick; the
+-- rest sweep only walks vehicles that moved lately, the full sweep paces itself.
+function PathFollower.keepalive()
+	local now = os.clock()
+	for model, due in _restDue do
+		if now < due then continue end
+		_restDue[model] = nil
+		local cf = _poseOf[model]
+		if cf and model.Parent and _npcIds[model] then queueKeep(model, cf) end
+	end
+	if now < _nextKeepalive then return end
+	_nextKeepalive = now + KEEPALIVE_DT
+	for model, cf in _poseOf do
+		if model.Parent and _npcIds[model] and now - (_movedAt[model] or 0) >= KEEPALIVE_DT then
+			queueKeep(model, cf)
+		end
 	end
 end
 
@@ -630,6 +688,10 @@ function PathFollower.place(state: FollowerState, pos: Vector3, dir: Vector3, dt
 
 	local lifted = pos + Vector3.new(0, state.heightOffset, 0)
 	local targetCF = CFrame.lookAt(lifted, lifted + travel, Vector3.yAxis)
+	local prev = state.smoothCFrame
+	if prev and (prev.Position - lifted).Magnitude > 1e-3 and isStreamed(model) then
+		_restDue[model] = os.clock() + REST_STEPS * math.max(dt or 0, 1 / 20)
+	end
 
 	local finalCF: CFrame
 

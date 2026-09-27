@@ -23,6 +23,7 @@ local Lighting          = game:GetService("Lighting")
 local OCConstants = require(ReplicatedStorage.City.OutsideConnectionConstants)
 local RoadConstants = require(ReplicatedStorage.Road.RoadConstants)
 local Settings = require(script.Parent.Parent.Core.Settings)
+local RenderPressure = require(script.Parent.Parent.Core.RenderPressure)
 
 local NPCDriverView = {}
 
@@ -59,7 +60,7 @@ end
 -- left everything past it taking the server's 2 Hz far keepalive raw -- visible 0.5 s steps.
 -- Now no distance cutoff: EVERY car in front of the camera interpolates. The fleet is capped
 -- at 12000 (CitizenService.MAX_CARS_TOTAL); cars behind the camera, and past 500 m all but a
--- sample (sampledOut), are hidden and skipped,
+-- sample the server stops streaming (see FAREWELL_PITCH), are hidden and skipped,
 -- so the worst case is a few hundred CFrame writes per frame -- cheaper than the chunking
 -- was ugly. Set a finite number here if a bigger fleet ever makes this measurable.
 -- ...and now there IS a cutoff, but it hides the car rather than just dropping it to the raw
@@ -71,21 +72,46 @@ end
 -- ...raised to 4000 on 2026-09-23. At 1200 a car was still ~5 px tall and blinked out as the
 -- camera moved -- visible flicker. At 4000 it is about a pixel. The fleet is capped at 400,
 -- so this is at most a few hundred CFrame writes a frame for cars in front of the camera.
+-- ...and it follows the device: the graphics preset sets it (a low-end device draws traffic out
+-- to 1500 studs, where a car is a few pixels, instead of paying for thousands of pixel-sized
+-- ones), and Core.RenderPressure pulls it in further while frames run slow or memory is short
+-- -- which covers the players who never open the settings.
+local CULL_DIST_BY_PRESET: { [string]: number } = { Low = 1500, Medium = 2500 }
 local CULL_DIST = 4000
 local RENDER_DIST_SQ = CULL_DIST * CULL_DIST
 -- Hysteresis, same idea as the +/-8 forward band below: come back 50 studs inside before
 -- showing again, so a camera parked on the boundary cannot flicker the fleet.
 local UNCULL_DIST_SQ = (CULL_DIST - 50) * (CULL_DIST - 50)
+-- Distant cars are redrawn every 2nd / 3rd frame (staggered by car): past these distances
+-- a whole frame of movement is a pixel or two, and the per-frame cost was every car.
+local STRIDE2_DIST = 600
+local STRIDE3_DIST = 1500
+local STRIDE2_DIST_SQ = STRIDE2_DIST * STRIDE2_DIST
+local STRIDE3_DIST_SQ = STRIDE3_DIST * STRIDE3_DIST
+local BUDGET_REFRESH_FRAMES = 60
+local _preset: string = "High"
+local function refreshBudget()
+	local detail = RenderPressure.detail()
+	local d = (CULL_DIST_BY_PRESET[_preset] or CULL_DIST) * detail
+	RENDER_DIST_SQ = d * d
+	UNCULL_DIST_SQ = (d - 50) * (d - 50)
+	STRIDE2_DIST_SQ = (STRIDE2_DIST * detail) ^ 2
+	STRIDE3_DIST_SQ = (STRIDE3_DIST * detail) ^ 2
+end
 local CULL_SCAN_FRAMES = 240 -- distant ambience can refresh over several seconds
--- Every vehicle is drawn within FULL_DETAIL_DIST (500 m); past it only a sample, thinning with
--- distance -- the same ids the server streams (PathFollower.poseInterval), so a car the
--- server stopped sending is never left frozen on screen.
-local FULL_DETAIL_DIST = 1000
-local MID_SAMPLE_DIST = 2000
+-- Past 500 m the server streams only a sample of the vehicles (PathFollower.poseInterval),
+-- and it says so: a vehicle's last pose before it leaves this player's stream carries
+-- FAREWELL_PITCH, and the view hides it until poses start again. The view used to re-derive
+-- that sample from its own camera, but the server's idea of the camera comes from a coarse
+-- report, so near 1000 studs the two disagreed -- and a car drawn here that the server no
+-- longer sent sat frozen while the traffic behind drove through it.
+local FAREWELL_PITCH = -128
+-- ...and a vehicle heard nothing from for this long is hidden too, in case its farewell was
+-- lost (the stream is unreliable). A stopped car is re-sent every 5 s (KEEPALIVE_REFRESH), so
+-- this allows one lost refresh before a still car is taken for gone.
+local SILENT_HIDE = 12
 -- Where the camera looks at the ground, reconstructed the way the server does from the
--- camera report (NPCDriverService.Bind). The server streams by the nearer of the camera and
--- this point; measuring from the camera alone hid half the cars on the very street being
--- looked at whenever a high city camera put it past FULL_DETAIL_DIST.
+-- camera report (NPCDriverService.Bind), for the distance cull below.
 local function groundFocus(cf: CFrame): Vector3?
 	local look = cf.LookVector
 	if look.Y >= -0.05 then return nil end
@@ -93,13 +119,6 @@ local function groundFocus(cf: CFrame): Vector3?
 	local hit = pos + look * ((RoadConstants.getGroundY() - pos.Y) / look.Y)
 	local h = RoadConstants.MAP_HALF_EXTENT
 	return Vector3.new(math.clamp(hit.X, -h, h), hit.Y, math.clamp(hit.Z, -h, h))
-end
-local function sampledOut(model: Model, flatSq: number, margin: number): boolean
-	if flatSq <= (FULL_DETAIL_DIST - margin) ^ 2 then return false end
-	local id = model:GetAttribute("NpcId")
-	if typeof(id) ~= "number" then return true end
-	local every = if flatSq <= (MID_SAMPLE_DIST - margin) ^ 2 then 2 else 4
-	return id % every ~= 0
 end
 -- CFrame readback carries tiny float error, so a delta below these counts as our own
 -- write, not a fresh server update.
@@ -148,6 +167,9 @@ type Active = {
 	targetTime: number,
 	streamAt: number?,    -- local clock when the newest stream pose was applied
 	delay: number,        -- how far behind real time this car renders (see step)
+	stride: number,       -- redrawn every `stride` frames (see STRIDE2_DIST_SQ)
+	phase: number,        -- which of those frames
+	skipped: number,      -- render time banked over skipped frames
 }
 
 -- Stream packet layout (must match PathFollower): f64 timestamp header, then
@@ -357,6 +379,9 @@ local _idConns: { [Model]: RBXScriptConnection } = {}
 -- Active (weak-keyed) because a car keeps receiving stream poses while it is tracked but
 -- NOT active, and the ordering guarantee has to survive that.
 local _streamStamp: { [Model]: number } = setmetatable({}, { __mode = "k" }) :: any
+-- Local clock of the newest pose, and whether it was a farewell (see FAREWELL_PITCH).
+local _heardAt: { [Model]: number } = setmetatable({}, { __mode = "k" }) :: any
+local _dropped: { [Model]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 local _trackedCount = 0
 local _cullCursor: Model? = nil
 
@@ -372,16 +397,18 @@ local function evaluateVisibility(model: Model, root: BasePart, camera: Camera)
 	end
 	local hidden = _hidden[model] == true
 	-- No stream pose yet: the replicated CFrame is where the vehicle was CREATED (the server
-	-- writes none after that), so drawing it would park a ghost at its spawn point.
-	local unseen = _streamStamp[model] == nil
+	-- writes none after that), so drawing it would park a ghost at its spawn point. Dropped
+	-- from the stream, or silent too long: the server is not moving it for us any more.
+	local unseen = _streamStamp[model] == nil or _dropped[model] == true
+		or _clock - (_heardAt[model] or -math.huge) > SILENT_HIDE
 
 	if hidden then
-		if not unseen and forward > 8 and flatSq < UNCULL_DIST_SQ and not sampledOut(model, flatSq, 50) then
+		if not unseen and forward > 8 and flatSq < UNCULL_DIST_SQ then
 			_hidden[model] = nil
 			hidden = false
 			setModelHidden(model, false)
 		end
-	elseif unseen or forward < -8 or flatSq > RENDER_DIST_SQ or sampledOut(model, flatSq, 0) then
+	elseif unseen or forward < -8 or flatSq > RENDER_DIST_SQ then
 		_hidden[model] = true
 		hidden = true
 		setModelHidden(model, true)
@@ -392,17 +419,26 @@ local function evaluateVisibility(model: Model, root: BasePart, camera: Camera)
 	if hidden then
 		_active[model] = nil
 		_fadeApplied[model] = nil
-	elseif not _active[model] then
-		_active[model] = {
-			root = root,
-			display = current,
-			lastWritten = nil,
-			prevPose = current,
-			prevTime = _clock,
-			targetPose = current,
-			targetTime = _clock,
-			delay = INTERP_DELAY,
-		}
+	else
+		local t = _active[model]
+		if not t then
+			local id = model:GetAttribute("NpcId")
+			t = {
+				root = root,
+				display = current,
+				lastWritten = nil,
+				prevPose = current,
+				prevTime = _clock,
+				targetPose = current,
+				targetTime = _clock,
+				delay = INTERP_DELAY,
+				stride = 1,
+				phase = if typeof(id) == "number" then id else 0,
+				skipped = 0,
+			}
+			_active[model] = t
+		end
+		t.stride = if flatSq > STRIDE3_DIST_SQ then 3 elseif flatSq > STRIDE2_DIST_SQ then 2 else 1
 	end
 
 	if hidden or not model:GetAttribute("MeshKit") then return end
@@ -451,7 +487,7 @@ local function track(model: Model)
 		_active[model] = {
 			root = root, display = current, lastWritten = nil,
 			prevPose = current, prevTime = _clock, targetPose = current, targetTime = _clock,
-			delay = INTERP_DELAY,
+			delay = INTERP_DELAY, stride = 1, phase = 0, skipped = 0,
 		}
 	end
 end
@@ -464,7 +500,14 @@ local function untrack(model: Model)
 		ic:Disconnect()
 		_idConns[model] = nil
 	end
+	-- Untagged on arrival, the car stays in the world, parked where the server put it: hand
+	-- back whatever this view had hidden or faded, or it would stand there invisible.
+	if model.Parent and (_hidden[model] or _fadeApplied[model]) then
+		setModelFade(model, 0)
+	end
 	_streamStamp[model] = nil
+	_heardAt[model] = nil
+	_dropped[model] = nil
 	_rigs[model] = nil
 	if _tracked[model] then
 		_tracked[model] = nil
@@ -496,8 +539,17 @@ local function scanVisibility(camera: Camera)
 	end
 end
 
+-- One batched move per frame instead of a CFrame write per car: workspace:BulkMoveTo is
+-- the cheapest way the engine offers to move many parts, and on a low-end device the
+-- per-write cost was the view's whole budget. Reused so a frame allocates nothing.
+local _moveParts: { BasePart } = {}
+local _moveCFrames: { CFrame } = {}
+local _frame = 0
+
 local function step(dt: number)
 	_clock += dt
+	_frame += 1
+	if _frame % BUDGET_REFRESH_FRAMES == 0 then refreshBudget() end
 	local camera = workspace.CurrentCamera
 	if camera then
 		_camPos = camera.CFrame.Position
@@ -512,13 +564,21 @@ local function step(dt: number)
 		refreshConnPts()
 	end
 
-	-- Only cars inside the active bubble pay interpolation cost every render frame.
+	-- Only cars inside the active bubble pay interpolation cost, the far ones not every frame.
+	table.clear(_moveParts)
+	table.clear(_moveCFrames)
 	for model, t in _active do
 		local root = t.root
 		if not root.Parent then
 			untrack(model)
 			continue
 		end
+		if t.stride > 1 and (_frame + t.phase) % t.stride ~= 0 then
+			t.skipped += dt
+			continue
+		end
+		local stepDt = dt + t.skipped
+		t.skipped = 0
 		local current = root.CFrame
 
 		if #_connPts > 0 then
@@ -564,14 +624,14 @@ local function step(dt: number)
 		if span > t.delay then
 			t.delay = math.min(span, MAX_SPAN)
 		elseif t.delay > INTERP_DELAY then
-			t.delay = math.max(INTERP_DELAY, t.delay - dt * 0.25)
+			t.delay = math.max(INTERP_DELAY, t.delay - stepDt * 0.25)
 		end
 		local pose = if span <= 1e-4 then t.targetPose
 			else t.prevPose:Lerp(t.targetPose, math.clamp((_clock - t.delay - t.prevTime) / span, 0, 1))
 
 		local rig = _rigs[model]
 		if rig then
-			updateRig(rig, t.display, pose, dt, (pose.Position - _camPos).Magnitude < SPIN_DIST)
+			updateRig(rig, t.display, pose, stepDt, (pose.Position - _camPos).Magnitude < SPIN_DIST)
 		end
 
 		-- Nothing left to interpolate: the car already sits on the pose we last wrote.
@@ -591,8 +651,12 @@ local function step(dt: number)
 
 		t.display = pose
 		t.lastWritten = pose
-		root.CFrame = pose
+		table.insert(_moveParts, root)
+		table.insert(_moveCFrames, pose)
 		if rig then articulate(rig, pose) end
+	end
+	if #_moveParts > 0 then
+		workspace:BulkMoveTo(_moveParts, _moveCFrames, Enum.BulkMoveMode.FireCFrameChanged)
 	end
 end
 
@@ -609,14 +673,29 @@ local function onStreamPacket(buf: buffer)
 		local root = _tracked[model]
 		if not root or not root.Parent then continue end
 		if stamp <= (_streamStamp[model] or 0) then continue end -- unordered: drop stale packets
-		local firstPose = _streamStamp[model] == nil
+		-- First pose ever, or the first since the server dropped it: draw it now rather than
+		-- waiting for the budgeted sweep.
+		local firstPose = _streamStamp[model] == nil or _dropped[model] == true
 		_streamStamp[model] = stamp
+		_heardAt[model] = _clock
 		local pos = Vector3.new(buffer.readf32(buf, off + 4), buffer.readf32(buf, off + 8), buffer.readf32(buf, off + 12))
 		local yaw = buffer.readu16(buf, off + 16) / 65535 * (2 * math.pi) - math.pi
-		local pitch = math.rad(buffer.readi8(buf, off + 18))
+		local pitchRaw = buffer.readi8(buf, off + 18)
+		local farewell = pitchRaw == FAREWELL_PITCH
+		local pitch = if farewell then 0 else math.rad(pitchRaw)
 		local cosP = math.cos(pitch)
 		local look = Vector3.new(-math.sin(yaw) * cosP, math.sin(pitch), -math.cos(yaw) * cosP)
 		local pose = CFrame.lookAt(pos, pos + look, Vector3.yAxis)
+
+		if farewell then
+			-- Leaving our stream: put it where it really is and hide it there.
+			_dropped[model] = true
+			root.CFrame = pose
+			local camera = workspace.CurrentCamera
+			if camera then evaluateVisibility(model, root, camera) end
+			continue
+		end
+		_dropped[model] = nil
 
 		local t = _active[model]
 		if not t then
@@ -668,10 +747,16 @@ function NPCDriverView.Start()
 	table.insert(_conns, RunService.RenderStepped:Connect(step))
 
 	_spin = SPIN_PRESETS[Settings.get("graphicsPreset")] == true
+	_preset = tostring(Settings.get("graphicsPreset"))
+	refreshBudget()
 	_running = true
 	-- Settings has no unsubscribe; _running keeps a stopped view from reacting.
 	Settings.onChanged("graphicsPreset", function(v)
-		if _running then _spin = SPIN_PRESETS[v] == true end
+		if _running then
+			_spin = SPIN_PRESETS[v] == true
+			_preset = tostring(v)
+			refreshBudget()
+		end
 	end)
 	-- Lamps follow the clock on a slow sweep, touching SurfaceAppearances only when night
 	-- actually flips (and makeRig lights new cars itself).

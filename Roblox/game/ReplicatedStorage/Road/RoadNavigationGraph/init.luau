@@ -608,6 +608,7 @@ function RoadNavigationGraph.new(segmentFilter: ((seg: any) -> boolean)?)
 		_network = nil :: any,
 		_nodeMouth = {} :: { [number]: { [number]: number } },
 		_edgeCongestion = {} :: { [string]: number },
+		_roadCongestion = {} :: { [string]: number },
 		-- Expected SECONDS of wait at the junction each approach edge feeds into
 		-- (Webster delay, published by TrafficSignalService). Zero for uncontrolled
 		-- junctions -- their cost is already in the turn penalty.
@@ -642,15 +643,31 @@ end
 -- can react to traffic without making every active car process a road-edit rebuild.
 function RoadNavigationGraph.SetCongestionSnapshot(self: any, snapshot: { [string]: number })
 	local clean: { [string]: number } = {}
+	-- Carriageway mean alongside each lane's own value (see GetRoadCongestion).
+	local roadSum: { [string]: number } = {}
 	for edgeId, pressure in snapshot do
-		if self._edges[edgeId] and typeof(pressure) == "number" then
+		local edge = self._edges[edgeId]
+		if edge and typeof(pressure) == "number" then
 			local value = math.clamp(pressure, 0, 1)
 			if value > 0.001 then
 				clean[edgeId] = value
+				local key = `{edge.segmentId}{if edge.forward then "+" else "-"}`
+				roadSum[key] = (roadSum[key] or 0) + value / math.max(1, edge.laneCountInDirection or 1)
 			end
 		end
 	end
 	self._edgeCongestion = clean
+	self._roadCongestion = roadSum
+end
+
+-- Mean congestion over every lane of this edge's carriageway (one road, one direction).
+-- The router prices the ROAD by this and each lane only by how far it sits above or below
+-- it, so a lane change is chosen for a real queue in one lane, not for noise between two.
+function RoadNavigationGraph.GetRoadCongestion(self: any, edgeId: string): number
+	local edge = self._edges[edgeId]
+	local roads = self._roadCongestion
+	if not edge or not roads then return 0 end
+	return roads[`{edge.segmentId}{if edge.forward then "+" else "-"}`] or 0
 end
 
 -- Every lane edge built from one network segment (both directions).
@@ -1115,6 +1132,7 @@ function RoadNavigationGraph.Rebuild(self: any, network: any, turnPermissions: {
 	self._network = network
 	self._nodeMouth = {}
 	self._edgeCongestion = {}
+	self._roadCongestion = {}
 	self._edgeControlDelay = {}
 	-- Edge ids do not survive a rebuild, so every booking is stale by definition.
 	self._edgeBookings = {}
@@ -2125,6 +2143,14 @@ end
 
 -- Cost of an existing route under the current congestion snapshot. The optional
 -- index lets a directed driver compare only the untravelled tail of its route.
+-- True when this lane runs off the map: it ends at an outside connection (a degree-1 node on
+-- the map edge). Which lane of such a road a car leaves by makes no difference to the trip.
+function RoadNavigationGraph.LeavesMap(self: any, edge: LaneEdge): boolean
+	local network = self._network
+	local node = network and network:getNodes()[edge.toNode]
+	return node ~= nil and #node.segments <= 1 and isMapEdgeNode(node)
+end
+
 function RoadNavigationGraph.EstimatePathCost(self: any, edgeIds: { string }, startIndex: number?, profile: any?): number
 	return NavRouter.estimatePathCost(self, edgeIds, startIndex, profile)
 end
