@@ -34,7 +34,7 @@ local DataCache = require(ReplicatedStorage:WaitForChild("DataCache"))
 local CursorRay = require(script.Parent.Parent:WaitForChild("Core"):WaitForChild("CursorRay"))
 local Settings = require(script.Parent.Parent:WaitForChild("Core"):WaitForChild("Settings"))
 local UiScratch = require(script.Parent.Parent:WaitForChild("Core"):WaitForChild("UiScratch"))
-local CoverageOverlay = require(script.Parent:WaitForChild("CoverageOverlay"))
+local UndergroundView = require(script.Parent:WaitForChild("UndergroundView"))
 local PlacementCostHud = require(script.Parent.Parent:WaitForChild("HUD"):WaitForChild("PlacementCostHud"))
 
 local WaterPipeController = {}
@@ -64,8 +64,6 @@ local ROAD_REFRESH = 1.0
 -- Every main lies this far under the surface (the server lays hand-drawn ones at the same
 -- depth), and the ground and roads go this see-through while the mains are showing.
 local BURY = ServiceTypes.PipeDepth
-local SEE_THROUGH = 0.5
-local SEE_FOLDERS = { "_Ground", "_RoadMeshes" }
 -- A water building's standpipe catches a drag end from further out than a pipe does: the
 -- cursor anywhere on the building should land on it.
 local TAP_SNAP = SRC_REACH + 16
@@ -89,7 +87,6 @@ local _folderConn: RBXScriptConnection? = nil
 local _preview: { BasePart } = {}
 local _roads: { BasePart } = {}
 local _marker: BasePart? = nil
-local _seeConns: { RBXScriptConnection } = {}
 local _nextRoadsAt = 0
 
 local function carries(): (boolean, boolean)
@@ -123,25 +120,14 @@ local function applyVisibility(root: Instance)
 	end
 end
 
-local function seeThrough(d: Instance)
-	if d:IsA("BasePart") then d.LocalTransparencyModifier = if _shown then SEE_THROUGH else 0 end
-end
-
 local function setPipesShown(on: boolean)
 	if on == _shown then return end
 	_shown = on
 	local f = pipeFolder()
 	if f then applyVisibility(f) end
-	-- The ground and the road surfaces go see-through so the buried mains show; chunks the
-	-- terrain streams in while the view is open get the same treatment.
-	for _, c in _seeConns do c:Disconnect() end
-	table.clear(_seeConns)
-	for _, name in SEE_FOLDERS do
-		local root = Workspace:FindFirstChild(name)
-		if not root then continue end
-		for _, d in root:GetDescendants() do seeThrough(d) end
-		if on then _seeConns[#_seeConns + 1] = root.DescendantAdded:Connect(seeThrough) end
-	end
+	-- The ground and the road surfaces go see-through so the buried mains show, and the city
+	-- drains of colour -- the shared x-ray (UndergroundView), which the road tool uses too.
+	UndergroundView.setActive("water", on)
 end
 
 -- == Snapping ==================================================================
@@ -558,7 +544,6 @@ function WaterPipeController.setEnabled(enabled: boolean)
 	_enabled = enabled
 	resetGesture()
 	setPipesShown(enabled)
-	CoverageOverlay.washCity(enabled)
 	if enabled then
 		refreshRoadMains(true) -- the streets' mains show on the first frame, not in a second
 	else
@@ -657,7 +642,7 @@ function WaterPipeController.Cleanup()
 	if _inputConn then _inputConn:Disconnect(); _inputConn = nil end
 	if _folderConn then _folderConn:Disconnect(); _folderConn = nil end
 	clearPreview()
-	CoverageOverlay.washCity(false)
+	setPipesShown(false)
 	_enabled = false
 	_bound = false
 end

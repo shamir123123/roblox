@@ -98,12 +98,34 @@ elseif scene == "signs" then
 	road(V.new(120, 0, 0), V.new(120, 0, -200), "OneWay")
 	road(V.new(120, 0, 200), V.new(120, 0, 0), "NarrowRoad")
 	road(V.new(-300, 0, -160), V.new(300, 0, -160), "NarrowRoad")
+elseif scene == "walls" then
+	-- retaining walls: a road raised one step (+4, below bridge height) with a street joining
+	-- it, a tunnel ramping down from the ground, and a road lowered one step (-4)
+	local TDS = R("ServerScriptService.Services.Terrain.TerrainDataService")
+	local RC = R("ReplicatedStorage.Road.RoadConstants")
+	local function centreY(x, z) return TDS.getSurfaceY(x, z) + RC.GROUND_ROAD_TOP_LIFT - RC.ROAD_THICKNESS * 0.5 end
+	local function place(a, b, t, vMode)
+		local d = b - a
+		local ok, err = RoadService.placeFromRequest({ p0 = a, p1 = a + d / 3, p2 = a + d * 2 / 3, p3 = b, roadType = t or "CollectorRoad", vMode = vMode })
+		print("road", vMode, ok, err)
+		Studio.step(0.2)
+	end
+	local g = centreY(0, 0)
+	place(V.new(-300, g + 4, 0), V.new(300, g + 4, 0), "CollectorRoad", "Elevated")
+	road(V.new(60, 0, 220), V.new(60, g + 4, 0), "NarrowRoad")
+	place(V.new(-300, g, -260), V.new(300, g - 24, -260), "CollectorRoad", "Tunnel")
+	place(V.new(-300, g - 4, 260), V.new(300, g - 4, 260), "NarrowRoad", "Tunnel")
 elseif scene == "cross" then
 	road(V.new(-260, 0, 0), V.new(260, 0, 0))
 	road(V.new(0, 0, -260), V.new(0, 0, 260))
 end
 for _ = 1, 20 do Studio.step(0.1) end
 local n = require("./render/dump")(Studio, Studio.game.Workspace, outFile)
+if process.env.DUMP3D then
+	-- DUMP3D="cx,cz,half": terrain + road faces for render/shade3d.py
+	local cx, cz, half = string.match(process.env.DUMP3D, "([^,]+),([^,]+),([^,]+)")
+	print("faces3d", require("./render/dump3d")(Studio, Studio.game.Workspace, outFile:gsub("%.json$", ".3d.json"), tonumber(cx), tonumber(cz), tonumber(half)))
+end
 -- lane centrelines (nav graph) as a separate overlay file
 do
 	local fs = require("@lune/fs")

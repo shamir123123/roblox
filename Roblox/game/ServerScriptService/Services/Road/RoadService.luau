@@ -8,6 +8,7 @@ local RoadNetwork = require(ReplicatedStorage.Road.RoadNetwork)
 local RoadTypeCatalog = require(ReplicatedStorage.Road.RoadTypeCatalog)
 local RoadRules = require(ReplicatedStorage.Road.RoadRules)
 local RoadNavigationGraph = require(ReplicatedStorage.Road.RoadNavigationGraph)
+local RoadCrossSection = require(ReplicatedStorage.Terrain.RoadCrossSection)
 local RoadVerticalProfile = require(ReplicatedStorage.Road.RoadVerticalProfile)
 local RoadMoveGeometry = require(ReplicatedStorage.Road.RoadMoveGeometry)
 local ApproachBend = require(ReplicatedStorage.Road.ApproachBend)
@@ -518,7 +519,9 @@ function RoadService.placeFromRequest(req: any, actor: Player?): (boolean, strin
 			end
 			local targetY = groundRoadCenterY(p.X, p.Z)
 			if req.vMode == "Elevated" then
-				return if p.Y - targetY > ROAD_ELEVATION_KEEP then p.Y else targetY
+				-- Raised by less than a bridge still holds its height: it becomes a road on a
+				-- walled embankment (RoadCrossSection retaining walls), as in Cities: Skylines 2.
+				return if p.Y - targetY >= RoadCrossSection.wallMinHeight then p.Y else targetY
 			end
 			return targetY
 		end
@@ -558,6 +561,9 @@ function RoadService.placeFromRequest(req: any, actor: Player?): (boolean, strin
 			if (req.vMode == "Elevated" and maxRise < ROAD_ELEVATION_KEEP)
 				or (req.vMode == "Tunnel" and maxDip > -ROAD_ELEVATION_KEEP) then
 				req.vMode = nil
+				-- It still holds the height it was asked for (holdGrade), and says so: a held
+				-- grade is what gets retaining walls, and it has to survive a save and load.
+				req.constSlope = true
 			end
 		end
 
@@ -872,7 +878,7 @@ end
 -- segments, (re)grade every changed/created one. Routed through here so the split
 -- pieces produced when two roads cross get graded, not only the single drawn
 -- segment -- otherwise natural ground pokes up through the new junction.
-local function syncSegmentGrades(change: { segmentIds: { number }, removedSegmentIds: { number }, gradeSegmentIds: { number }? })
+local function syncSegmentGrades(change: { segmentIds: { number }, removedSegmentIds: { number }, gradeSegmentIds: { number }?, nodeIds: { number }? })
 	if not terrainGradeEnabled() then return end
 	for _, id in change.removedSegmentIds do
 		pcall(TerrainGradeService.ungradeSegmentId, id)
@@ -887,6 +893,27 @@ local function syncSegmentGrades(change: { segmentIds: { number }, removedSegmen
 	local regradeIds = if #change.removedSegmentIds > 0
 		then change.segmentIds
 		else (change.gradeSegmentIds or change.segmentIds)
+	-- A road joining an existing node can turn it into a junction without touching the roads
+	-- already there: their retaining walls must now keep clear of its corners, so they are
+	-- re-graded too. Only at junction nodes, so ordinary edits stay as cheap as before.
+	if change.nodeIds then
+		local listed: { [number]: boolean } = {}
+		for _, id in regradeIds do listed[id] = true end
+		local extra: { number }? = nil
+		for _, nodeId in change.nodeIds do
+			local node = _network:getNodes()[nodeId]
+			if node and #node.segments >= 3 then
+				for _, sid in node.segments do
+					if not listed[sid] then
+						listed[sid] = true
+						extra = extra or table.clone(regradeIds)
+						table.insert(extra :: { number }, sid)
+					end
+				end
+			end
+		end
+		if extra then regradeIds = extra end
+	end
 	for _, id in regradeIds do
 		local s = _network:getSegment(id)
 		if s then
@@ -2617,6 +2644,18 @@ function RoadService.Init()
 	})
 
 	RoadSceneRenderer.init(_network, _navGraph)
+	-- Retaining walls keep clear of junctions and dead ends (RoadCrossSection.wallNodeClear):
+	-- the grade asks the network how many roads meet at a node and how wide the widest is.
+	TerrainGradeService.setNodeInfo(function(nodeId: number): (number, number)
+		local node = _network:getNodes()[nodeId]
+		if not node then return 1, 0 end
+		local widest = 0
+		for _, sid in node.segments do
+			local sg = _network:getSegment(sid)
+			if sg then widest = math.max(widest, getCachedRoadSpec(sg.roadType).width) end
+		end
+		return #node.segments, widest
+	end)
 	RoadHistoryService.init(function()
 		return _network:getSegments()
 	end, applySnapshot)

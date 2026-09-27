@@ -12,16 +12,21 @@ local RoadMeshBuilder = require(ReplicatedStorage.Road.RoadMeshBuilder)
 local IntersectionRenderer = require(ReplicatedStorage.Road.IntersectionRenderer)
 local DeadEndRenderer = require(ReplicatedStorage.Road.DeadEndRenderer)
 local RoadRules = require(ReplicatedStorage.Road.RoadRules)
+local RoadCrossSection = require(ReplicatedStorage.Terrain.RoadCrossSection)
 -- Terrain access is server-only infra; on the client, init() must inject equivalents
 -- via deps (getSurfaceY from the local heightmap; grade calls are server-side no-ops).
 local _getSurfaceY: (number, number) -> number
-local _gradeConnector: (any, Vector3, Vector3, Vector3, Vector3, number, boolean?, number?) -> () = function() end
+local _gradeConnector: (any, Vector3, Vector3, Vector3, Vector3, number, boolean?, number?, string?) -> () = function() end
 local _ungradeConnector: (any) -> () = function() end
+-- Natural (pre-road) ground, for the retaining walls. Server only: a client-side render (no
+-- terrain ledger) simply builds no walls.
+local _getNaturalY: ((number, number) -> number)? = nil
 if RunService:IsServer() then
 	local ServerScriptService = game:GetService("ServerScriptService")
 	local TerrainGradeService = require(ServerScriptService.Services.Terrain.TerrainGradeService)
 	local TerrainDataService = require(ServerScriptService.Services.Terrain.TerrainDataService)
 	_getSurfaceY = TerrainDataService.getSurfaceY
+	_getNaturalY = TerrainDataService.getNaturalSurfaceY
 	_gradeConnector = TerrainGradeService.gradeConnector
 	_ungradeConnector = TerrainGradeService.ungradeConnector
 else
@@ -1120,82 +1125,155 @@ local function addElevationPillars(model: Model, seg: Types.Segment, p0: Vector3
 	})
 end
 
--- Below-grade tunnel: retaining side walls from the road surface up to natural ground
--- along both edges. v1 = open cut (NO ceiling); walls simply end at the segment's ends,
--- which read as the portals. Sampled along the curve like the pillars. CanQuery=false so
--- the nav/placement rays only ever hit the road surface, never the walls.
+-- == Retaining walls (Cities: Skylines 2) ====================================
+-- A road raised less than a bridge sits on walled fill; one lowered less than a tunnel runs
+-- in a walled cut (a tunnel's approach ramp too). Where the footway top and the NATURAL
+-- ground beside the road differ by RoadCrossSection.wallMinHeight or more, a concrete wall
+-- stands at the back of the footway and TerrainGradeService leaves the land outside it at its
+-- natural height -- both sides decide with RoadCrossSection.wallStep, so a wall never stands
+-- without its step or a step without its wall.
 --
--- OFF for now. The walls sample natural ground per step and run a slab up to it, which was
--- written against VOXEL terrain; on the mesh they come out as huge jagged sawtooth panels
--- standing out of the ground rather than a retaining wall. Turning them off leaves a clean
--- open cut, which reads far better than a broken wall, and the sunken road itself is fine.
--- ponytail: a flag rather than a delete, because the fix is to rebuild them off the graded
--- cut profile (RoadCrossSection) instead of raw terrain samples -- the geometry is wanted,
--- the sampling is what is wrong.
-local TUNNEL_WALLS_ENABLED = false
+-- The walls are measured from the natural ground (the terrain ledger's original heights),
+-- never from the graded ground: the road has already cut or filled that, which is what made
+-- the old tunnel walls come out as sawtooth panels standing out of the ground. Each side is a
+-- welded strip (inner face, outer face, top), so the top edge is one smooth line; a run
+-- carries one station past each end at its real (small) height, so walls taper out instead
+-- of stopping dead. They bake into the road piece's mesh like the kerbs -- no Parts.
+local WALL_STEP = 4            -- studs between wall stations (one terrain corner spacing)
+local WALL_COLOR = Color3.fromRGB(170, 170, 175) -- kerb concrete: bakes with the pavement look
+local WALL_LIP = 0.6           -- a cut wall stands this far proud of the ground it holds back
+local WALL_PARAPET = 1.1       -- a fill wall stands this far above the footway: its railing
+local WALL_EMBED = 1.5         -- and reaches this far into the ground at its foot
+local PORTAL_CLEARANCE = 9     -- studs of headroom under a tunnel portal
+local PORTAL_THICKNESS = 2
+local PORTAL_MOUTH_COLOR = Color3.fromRGB(22, 22, 26)
+local WALL_COPING = 6          -- a cut wall's top covers this much of the ground behind it,
+                               -- where the terrain lattice bevels up from the bed to natural
 
-local function addTunnelWalls(model: Model, p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, width: number)
-	if not TUNNEL_WALLS_ENABLED then return end
-	local length = BezierUtil.length(p0, p1, p2, p3, RoadConstants.SAMPLES_PER_SEGMENT)
-	local steps = math.clamp(math.floor(length / 8), 2, 64)
-	local halfThick = RoadConstants.ROAD_THICKNESS * 0.5
-	local thk = RoadConstants.TUNNEL_WALL_THICKNESS
-	-- Walls stand BEHIND the sidewalk (kerb inside the trench, wall at its back edge).
-	local edgeOff = width * 0.5 + RoadConstants.SIDEWALK_WIDTH + thk * 0.5
-	local function groundYAt(pt: Vector3): number
-		local ok, y = pcall(_getSurfaceY, pt.X, pt.Z)
-		return if ok then y else RoadConstants.getGroundY()
+-- Where walls start along a road from `nodeId` (0 at a plain continuation).
+local function wallClearAt(nodeId: number, ownWidth: number): number
+	local node = _network and _network:getNodes()[nodeId]
+	if not node then return RoadCrossSection.wallNodeClear(1, ownWidth) end
+	local widest = ownWidth
+	for _, sid in node.segments do
+		local sg = _network:getSegment(sid)
+		if sg then widest = math.max(widest, RoadTypeCatalog.getOrDefault(sg.roadType).width) end
 	end
-	local walls: Folder? = nil
-	local prev = p0
-	for i = 1, steps do
-		local pt = BezierUtil.point(p0, p1, p2, p3, i / steps)
-		local chord = Vector3.new(pt.X - prev.X, 0, pt.Z - prev.Z)
-		local len = chord.Magnitude
-		if len > 1e-3 then
-			local mid = (prev + pt) * 0.5
-			local dir = chord / len
-			local side = Vector3.new(-dir.Z, 0, dir.X)
-			local surfaceY = mid.Y + halfThick
-			-- Ground probed just OUTSIDE the cut, per side: the trench floor is dug,
-			-- so a centerline sample after grading collapses the walls on a re-render,
-			-- and per-side heights give a one-sided retaining wall on a cross-slope
-			-- (CS2-style). 7 = one corner span past the bed + margin.
-			local probeOff = width * 0.5 + RoadConstants.SIDEWALK_WIDTH + thk + 7
-			for _, s in { -1, 1 } do
-				local out = side * (s * probeOff)
-				local groundY = math.max(groundYAt(prev + out), groundYAt(pt + out))
-				-- Wall band mirrors TerrainGradeService's depth tiers: shallower than 6
-				-- the road is just sunken terrain (no walls); deeper than ~16 the tunnel
-				-- is covered by terrain (no trench, no walls).
-				local depth = groundY - surfaceY
-				if depth >= 6 and depth <= 18 then
-					-- +1 lip above the visible grass so the render bulge / surface
-					-- noise never crests through the wall top.
-					local wallH = depth + 1
-					if not walls then
-						walls = Instance.new("Folder")
-						walls.Name = "TunnelWalls"
-						walls.Parent = model
-					end
-					local center = Vector3.new(mid.X, surfaceY + wallH * 0.5, mid.Z) + side * (s * edgeOff)
-					local wall = Instance.new("Part")
-					wall.Name = "TunnelWall"
-					wall.Anchored = true
-					wall.CanCollide = true
-					wall.CanTouch = false
-					wall.CanQuery = false
-					wall.CastShadow = true
-					wall.Material = Enum.Material.Concrete
-					wall.Color = RoadConstants.TUNNEL_WALL_COLOR
-					wall.Size = Vector3.new(thk, wallH, len + 0.5)
-					wall.CFrame = CFrame.lookAt(center, center + dir, Vector3.yAxis)
-					wall.Parent = walls :: Folder
+	return RoadCrossSection.wallNodeClear(#node.segments, widest)
+end
+
+local function addRetainingWalls(model: Model, p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, spec: any, vMode: string?, clearStart: number, clearEnd: number)
+	local natural = _getNaturalY
+	if not natural then return end
+	local walk = if spec.noSidewalk then 0 else RoadConstants.SIDEWALK_WIDTH
+	local halfThick = RoadConstants.ROAD_THICKNESS * 0.5
+	local thk = RoadCrossSection.wallThickness
+	local inner = RoadCrossSection.wallInnerOffset(spec.width, walk)
+	local length = BezierUtil.length(p0, p1, p2, p3, RoadConstants.SAMPLES_PER_SEGMENT)
+	if length < WALL_STEP then return end
+	local n = math.clamp(math.ceil(length / WALL_STEP), 2, 256)
+	local centres: { Vector3 } = table.create(n + 1)
+	local sides: { Vector3 } = table.create(n + 1)
+	local lastSide = Vector3.xAxis
+	for i = 0, n do
+		local t = i / n
+		local tan = BezierUtil.tangent(p0, p1, p2, p3, t)
+		local flat = Vector3.new(tan.X, 0, tan.Z)
+		if flat.Magnitude > 1e-4 then
+			flat = flat.Unit
+			lastSide = Vector3.new(-flat.Z, 0, flat.X)
+		end
+		centres[i + 1] = BezierUtil.point(p0, p1, p2, p3, t)
+		sides[i + 1] = lastSide
+	end
+	local builder = RoadMeshBuilder.new()
+	for _, sgn in { -1, 1 } do
+		local step: { number } = table.create(n + 1)
+		local nat: { number } = table.create(n + 1)
+		local edge: { number } = table.create(n + 1)
+		for i = 1, n + 1 do
+			local c = centres[i]
+			local mid = c + sides[i] * (sgn * (inner + thk * 0.5))
+			local ok, y = pcall(natural, mid.X, mid.Z)
+			nat[i] = if ok then y else c.Y
+			edge[i] = RoadCrossSection.edgeTopY(c.Y + halfThick, walk)
+			local along = length * (i - 1) / n
+			step[i] = if along >= clearStart and along <= length - clearEnd
+				then RoadCrossSection.wallStep(c.Y, halfThick, walk, nat[i], vMode)
+				else 0
+		end
+		local i = 1
+		while i <= n + 1 do
+			if step[i] == 0 then
+				i += 1
+				continue
+			end
+			local a = i
+			while i <= n + 1 and step[i] ~= 0 do i += 1 end
+			local lo, hi = math.max(1, a - 1), math.min(n + 1, i)
+			local isCut = step[a] > 0
+			local inB, inT, outB, outT, copeO = {}, {}, {}, {}, {}
+			for k = lo, hi do
+				local c, side = centres[k], sides[k] * sgn
+				local cut = nat[k] >= edge[k]
+				local top = if cut then nat[k] + WALL_LIP else edge[k] + WALL_PARAPET
+				local bottom = if cut then edge[k] - RoadConstants.SIDEWALK_HEIGHT else nat[k] - WALL_EMBED
+				local pi = c + side * inner
+				local po = c + side * (inner + thk)
+				table.insert(inB, Vector3.new(pi.X, bottom, pi.Z))
+				table.insert(inT, Vector3.new(pi.X, top, pi.Z))
+				table.insert(outB, Vector3.new(po.X, bottom, po.Z))
+				table.insert(outT, Vector3.new(po.X, top, po.Z))
+				local pc = c + side * (inner + thk + WALL_COPING)
+				table.insert(copeO, Vector3.new(pc.X, top, pc.Z))
+			end
+			if #inB >= 2 then
+				builder:addSurfaceStrip(inB, inT, WALL_COLOR, thk)
+				builder:addSurfaceStrip(outB, outT, WALL_COLOR, thk)
+				builder:addSurfaceStrip(inT, outT, WALL_COLOR, thk)
+				if isCut then builder:addSurfaceStrip(outT, copeO, WALL_COLOR, 0.4) end
+				-- End faces, so a wall reads solid where it stops.
+				for _, e in { 1, #inB } do
+					builder:addSurfaceStrip({ inB[e], inT[e] }, { outB[e], outT[e] }, WALL_COLOR, thk)
 				end
 			end
 		end
-		prev = pt
 	end
+	-- Tunnel portal: where the walled cut meets the covered tunnel the cut would end in a bank
+	-- of ground. A concrete headwall spans the cut there, over a dark mouth the road runs into.
+	if vMode == "Tunnel" then
+		local function covered(i: number): boolean
+			local c = centres[i]
+			local ok, y = pcall(natural, c.X, c.Z)
+			return ok and y - (c.Y + halfThick) >= RoadCrossSection.coverDepth
+		end
+		local prevCovered = covered(1)
+		for i = 2, n + 1 do
+			local cov = covered(i)
+			if cov ~= prevCovered then
+				-- The station on the open side of the change, facing into the cut.
+				local k = if cov then i - 1 else i
+				local c, side = centres[k], sides[k]
+				local along = Vector3.new(side.Z, 0, -side.X) * (if cov then 1 else -1)
+				local roadTop = c.Y + halfThick
+				local ok, y = pcall(natural, c.X, c.Z)
+				local groundY = if ok then y else roadTop + RoadCrossSection.coverDepth
+				local span = (inner + thk) * 2
+				local mouthTop = roadTop + PORTAL_CLEARANCE
+				local headH = math.max(1, groundY + WALL_LIP - mouthTop)
+				local look = CFrame.lookAt(Vector3.zero, along)
+				builder:addBox(look + Vector3.new(c.X, mouthTop + headH * 0.5, c.Z), Vector3.new(span, headH, PORTAL_THICKNESS), WALL_COLOR)
+				-- The mouth: a dark panel on the headwall's face, in front of the bank of ground
+				-- the cut ends in, so the road reads as running in.
+				local m = Vector3.new(c.X, 0, c.Z) - along * (PORTAL_THICKNESS * 0.5 + 0.3)
+				builder:addBox(look + Vector3.new(m.X, roadTop + PORTAL_CLEARANCE * 0.5, m.Z),
+					Vector3.new(span - thk * 2, PORTAL_CLEARANCE, 0.4), PORTAL_MOUTH_COLOR)
+			end
+			prevCovered = cov
+		end
+	end
+	local walls = builder:bake({ name = "RetainingWalls", canCollide = false })
+	if walls then walls.Parent = model end
 end
 
 -- Retaining wall wrapped around a tunnel dead-end bulb: chords along the semicircle
@@ -2027,8 +2105,14 @@ local function renderSegment(seg: Types.Segment)
 		isRail = spec.isRail,
 	})
 		addElevationPillars(newModel :: Model, seg, rp0, rp1, rp2, rp3, seg.vMode, spec)
-		if seg.vMode == "Tunnel" then
-			addTunnelWalls(newModel :: Model, rp0, rp1, rp2, rp3, spec.width)
+		if RoadCrossSection.takesWalls(spec, seg) then
+			-- Clear distances are from the nodes; this piece is drawn from its trimmed ends.
+			local flatDist = function(a: Vector3, b: Vector3): number
+				return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+			end
+			addRetainingWalls(newModel :: Model, rp0, rp1, rp2, rp3, spec, seg.vMode,
+				wallClearAt(seg.startNode, spec.width) - flatDist(rp0, seg.p0),
+				wallClearAt(seg.endNode, spec.width) - flatDist(rp3, seg.p3))
 		end
 	end, debug.traceback)
 	if not built or not newModel then
@@ -2507,13 +2591,20 @@ local function refreshNode(nodeId: Types.NodeId)
 		local isRingNode = _network.isRoundaboutNode ~= nil and _network:isRoundaboutNode(nodeId)
 		local bothTunnel = startSeg ~= nil and endSeg ~= nil
 			and (startSeg :: any).vMode == "Tunnel" and (endSeg :: any).vMode == "Tunnel"
-		if bothTunnel then
-			-- The bend is part of the cut: walls follow the connector arc so the
-			-- trench wall doesn't break open at every corner node.
-			addTunnelWalls(model, p0, c1, c2, p3, connSpec.width)
+		-- The bend carries the roads' retaining walls round it (when both roads are built the
+		-- same way), so a walled cut or fill doesn't break open at every bend.
+		local wallMode: string? = nil
+		if startSeg and endSeg and not isRingNode
+			and RoadCrossSection.takesWalls(RoadTypeCatalog.getOrDefault((startSeg :: any).roadType), startSeg)
+			and RoadCrossSection.takesWalls(RoadTypeCatalog.getOrDefault((endSeg :: any).roadType), endSeg)
+			and ((startSeg :: any).vMode or "Ground") == ((endSeg :: any).vMode or "Ground") then
+			wallMode = (startSeg :: any).vMode or "Ground"
+		end
+		if wallMode then
+			addRetainingWalls(model, p0, c1, c2, p3, connSpec, wallMode, 0, 0)
 		end
 		if workspace:GetAttribute("RoadGradeTerrain") ~= false and not isRingNode then
-			_gradeConnector(nodeId, p0, c1, c2, p3, connSpec.width, bothTunnel, (if connSpec.noSidewalk then 0 else RoadConstants.SIDEWALK_WIDTH))
+			_gradeConnector(nodeId, p0, c1, c2, p3, connSpec.width, bothTunnel, (if connSpec.noSidewalk then 0 else RoadConstants.SIDEWALK_WIDTH), wallMode)
 		end
 		return
 	end
@@ -2594,7 +2685,7 @@ end
 
 export type Deps = {
 	getSurfaceY: (number, number) -> number,
-	gradeConnector: ((any, Vector3, Vector3, Vector3, Vector3, number, boolean?, number?) -> ())?,
+	gradeConnector: ((any, Vector3, Vector3, Vector3, Vector3, number, boolean?, number?, string?) -> ())?,
 	ungradeConnector: ((any) -> ())?,
 }
 

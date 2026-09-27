@@ -163,4 +163,63 @@ function RoadCrossSection.verticalModeFor(
 	return RoadCrossSection.GROUND
 end
 
+-- == Retaining walls (Cities: Skylines 2) ====================================
+-- Where the top of the footway and the natural ground beside the road differ by
+-- WALL_MIN_HEIGHT or more, the ground does not bank down (or up) to meet the road. A
+-- retaining wall stands at the back of the footway and the land outside it keeps its natural
+-- height: a road raised less than a bridge sits on walled fill, one lowered less than a
+-- tunnel runs in a walled cut, and a tunnel's approach ramp is walled from here down.
+-- TerrainGradeService shapes the ground and RoadSceneRenderer builds the walls, both from
+-- these functions -- so a wall never stands without its step, or a step without its wall.
+local WALL_MIN_HEIGHT = 3      -- studs (1.5 m); smaller steps bank into the ground as before
+local SPAN_MIN_HEIGHT = 6      -- an Elevated span higher than this is a bridge (no fill, no walls)
+local COVER_DEPTH = 16         -- a Tunnel this far below the ground is covered: no cut, no walls
+-- Walls keep this far (plus half the widest road) from a junction or a dead end: nothing
+-- wraps a junction's corners or a turnaround bulb, so the ground banks there as it always did.
+local WALL_NODE_CLEAR = RoadConstants.SIDEWALK_WIDTH + 12
+
+RoadCrossSection.wallMinHeight = WALL_MIN_HEIGHT
+RoadCrossSection.spanMinHeight = SPAN_MIN_HEIGHT
+RoadCrossSection.coverDepth = COVER_DEPTH
+RoadCrossSection.wallThickness = RoadConstants.TUNNEL_WALL_THICKNESS
+
+-- Top of the footway -- or of the carriageway, on a road without one -- for a slab whose top
+-- is roadTopY. The wall is measured from here.
+function RoadCrossSection.edgeTopY(roadTopY: number, walkWidth: number): number
+	return if walkWidth > 0 then roadTopY + WALK_HEIGHT else roadTopY
+end
+
+-- Lateral distance of the wall's road-side face: the back of the footway.
+function RoadCrossSection.wallInnerOffset(width: number, walkWidth: number): number
+	return width * 0.5 + walkWidth
+end
+
+-- The signed step a wall has to hold, beside a road whose slab centre is at centreY:
+-- natural visible ground minus the edge top. > 0 is a cut (the wall holds the hillside
+-- back), < 0 a fill (it holds the road up), 0 means no wall -- the step is small, the road is
+-- a bridge there, or a covered tunnel. `vMode` is the segment's ("Ground" when nil).
+function RoadCrossSection.wallStep(centreY: number, halfThick: number, walkWidth: number, naturalY: number, vMode: string?): number
+	local roadTopY = centreY + halfThick
+	if vMode == "Elevated" and roadTopY - naturalY > SPAN_MIN_HEIGHT then return 0 end
+	if vMode == "Tunnel" and naturalY - roadTopY >= COVER_DEPTH then return 0 end
+	local step = naturalY - RoadCrossSection.edgeTopY(roadTopY, walkWidth)
+	return if math.abs(step) >= WALL_MIN_HEIGHT then step else 0
+end
+
+-- How far along a road from a node its walls start: 0 at a plain continuation (2 arms, the
+-- wall runs on round the bend), clear of the corners at a junction or a dead end.
+function RoadCrossSection.wallNodeClear(armCount: number, widestWidth: number): number
+	if armCount == 2 then return 0 end
+	return widestWidth * 0.5 + WALL_NODE_CLEAR
+end
+
+-- Which roads get walls: ones the player set at a height or a depth -- Elevated, Tunnel, or
+-- held at a constant grade (which is also what a road raised or lowered by less than a
+-- bridge / tunnel becomes). A ground road that follows the terrain banks into it with slopes
+-- as it always did. Never terrain paths (they lie ON the land) or roundabout rings.
+function RoadCrossSection.takesWalls(spec: any, seg: any): boolean
+	if spec.terrainPath or seg.isArc or seg.isRoundabout then return false end
+	return seg.vMode == "Elevated" or seg.vMode == "Tunnel" or seg.constSlope == true
+end
+
 return RoadCrossSection

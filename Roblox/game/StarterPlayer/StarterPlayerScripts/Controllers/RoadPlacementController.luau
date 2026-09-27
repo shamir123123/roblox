@@ -17,6 +17,7 @@ local SnapUtil        = require(ReplicatedStorage.Road.SnapUtil)
 local PlacementGrid   = require(ReplicatedStorage.Shared.PlacementGrid)
 local Snapper         = require(script.Parent.RoadPlacementSnapper)
 local GhostPreview    = require(script.Parent.RoadGhostPreviewController)
+local UndergroundView = require(script.Parent:WaitForChild("UndergroundView"))
 local DeleteHover     = require(script.Parent:WaitForChild("DeleteHoverController"))
 local NotificationController = require(script.Parent.Parent:WaitForChild("HUD"):WaitForChild("NotificationController"))
 local Settings = require(script.Parent.Parent:WaitForChild("Core"):WaitForChild("Settings"))
@@ -212,6 +213,14 @@ local function resolveVMode(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3):
 		pts[i + 1] = BezierUtil.point(p0, p1, p2, p3, i / 12)
 	end
 	return RoadCrossSection.verticalModeFor(pts, groundSurfaceYAt, AUTO_ALLOW) :: VerticalMode
+end
+
+-- The x-ray view (UndergroundView, the water view's look) is on while this tool is building
+-- below the ground: Tunnel mode, or Auto when the span being drawn comes out as a tunnel.
+local _previewTunnel = false
+local function refreshUnderground()
+	local on = _phase ~= "Disabled" and (_verticalMode == "Tunnel" or _previewTunnel)
+	UndergroundView.setActive("roads", on, true)
 end
 -- Keep placement on the map: clamp the ground pick's X/Z to the boundary so neither the
 -- preview reticle nor a placed endpoint can run off the edge into the void. When the pick
@@ -549,6 +558,10 @@ local function updateGhost()
 	local skipValidation = (_mode == "Curved" and _phase == "HasStart")
 		or (_mode == "Freeform" and _phase == "HasStart" and not _freeformTangent)
 		or (_mode == "AdvancedCurve" and (_phase == "HasStart" or _phase == "HasCurve"))
+
+	_previewTunnel = _autoVertical and _verticalOffset == 0
+		and resolveVMode(p0 :: Vector3, p1 :: Vector3, p2 :: Vector3, p3 :: Vector3) == "Tunnel"
+	refreshUnderground()
 
 	GhostPreview.update({
 		p0 = p0 :: Vector3, p1 = p1 :: Vector3, p2 = p2 :: Vector3, p3 = p3 :: Vector3,
@@ -918,6 +931,7 @@ function RoadPlacementController.setElevation(height: number)
 	-- it, so the two can never disagree. (A stray "Elevated" flag on a ground-height
 	-- road strands it on its own network layer, unable to weld to ground roads.)
 	_verticalMode = if clamped > 0 then "Elevated" elseif clamped < 0 then "Tunnel" else "Ground"
+	refreshUnderground()
 	_lastSnapResult = nil
 	GhostPreview.clear()
 	Snapper.invalidateCaches()
@@ -975,7 +989,9 @@ function RoadPlacementController.setEnabled(enabled: boolean)
 	elseif not enabled then
 		_phase = "Disabled"
 		cancel()
+		_previewTunnel = false
 	end
+	refreshUnderground()
 	-- Publish road-mode state for the outside-connection arrows (they show only in road mode).
 	Players.LocalPlayer:SetAttribute("RoadToolActive", _phase ~= "Disabled")
 end

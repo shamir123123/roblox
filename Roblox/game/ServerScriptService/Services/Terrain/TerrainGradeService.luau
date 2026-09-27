@@ -192,13 +192,17 @@ local WRITE_YIELD_CHECK_EVERY = 256
 -- job, which is keeping a road off a building's locked foundation ("pad:").
 local ROAD_KIND = "road:"
 
-local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number, _maxX: number, _minZ: number, _maxZ: number, width: number, spanAsBridge: boolean, materialId: number?, cutWalls: boolean?, walkWidth: number?)
+-- Retaining walls for this grade (RoadCrossSection.wallStep): the segment's vertical mode,
+-- and how far from each end (along the road) walls may start -- see wallNodeClear.
+export type WallOpts = { vMode: string?, clearStart: number, clearEnd: number }
+
+local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number, _maxX: number, _minZ: number, _maxZ: number, width: number, spanAsBridge: boolean, materialId: number?, cutWalls: boolean?, walkWidth: number?, wallOpts: WallOpts?)
 	local led = ledger()
 	if not led or not led:beginOwner(ownerKey) then return end -- already graded under this key
 
 	-- Terrain-path paint: the bed corners within ~half-width get the road's material. A little
 	-- past the carriageway edge so the painted strip reads as the path, not the whole graded bed.
-	local hm = if materialId or cutWalls then TerrainDataService.getHeightmap() else nil
+	local hm = if materialId or cutWalls or wallOpts then TerrainDataService.getHeightmap() else nil
 	local paintHalf = width * 0.5 + 2
 
 	local generation = (_ownerGeneration[ownerKey] or 0) + 1
@@ -237,11 +241,19 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 	--               sample recomputed each corner dozens of times over.
 	local bestDistanceSq: { [number]: number } = {}
 	local bestCenterY: { [number]: number } = {}
+	-- Which sample each corner took its height from, and the arc length at every sample:
+	-- walls keep clear of junction / dead-end nodes by distance ALONG the road.
+	local bestIndex: { [number]: number } = {}
+	local cum = table.create(#pts)
+	cum[1] = 0
+	for i = 2, #pts do cum[i] = cum[i - 1] + (pts[i] - pts[i - 1]).Magnitude end
+	local totalLen = cum[#pts] or 0
+	local wallInner = RoadCrossSection.wallInnerOffset(width, walkWidth or RoadConstants.SIDEWALK_WIDTH)
 	local budgetUntil = os.clock() + FRAME_BUDGET
 	local superseded = false
 
 	-- False when a newer grade claimed this owner key mid-pass; the caller must bail.
-	local function stampPoint(p: Vector3, stampReach: number, stampReachSq: number): boolean
+	local function stampPoint(p: Vector3, index: number, stampReach: number, stampReachSq: number): boolean
 		local gxMin = math.clamp(math.floor(worldToCorner(p.X - stampReach)), 0, MAX_CORNER)
 		local gxMax = math.clamp(math.ceil(worldToCorner(p.X + stampReach)), 0, MAX_CORNER)
 		local gzMin = math.clamp(math.floor(worldToCorner(p.Z - stampReach)), 0, MAX_CORNER)
@@ -260,6 +272,7 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 					if not prior or d2 < prior then
 						bestDistanceSq[key] = d2
 						bestCenterY[key] = py
+						bestIndex[key] = index
 					end
 				end
 			end
@@ -280,7 +293,7 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 		local n = #pts
 		local i = 1
 		while i <= n do
-			if not stampPoint(pts[i], stampReach, stampReachSq) then
+			if not stampPoint(pts[i], i, stampReach, stampReachSq) then
 				superseded = true
 				return
 			end
@@ -312,6 +325,24 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 		local cutDepth = if cutWalls then naturalY - centerY else -math.huge
 		local covered = cutWalls and cutDepth >= TUNNEL_COVER_DEPTH
 		local hardCut = cutWalls and not covered and cutDepth >= CUT_WALL_MIN_DEPTH
+		-- Retaining walls (RoadCrossSection.wallStep, the same test the renderer builds the
+		-- walls from). A walled CUT is the open-cut tier: bed out past the wall, no shoulder.
+		-- A walled FILL raises only the ground inside the wall; outside it the land stays
+		-- natural -- no embankment.
+		local walledFill = false
+		if wallOpts and naturalY >= SEA_Y then
+			local visNatural = naturalY + RENDER_BULGE
+			local roadTop = centerY + halfThick
+			local vMode = wallOpts.vMode
+			shouldSpan = spanAsBridge and roadTop - visNatural > RoadCrossSection.spanMinHeight
+			covered = vMode == "Tunnel" and visNatural - roadTop >= RoadCrossSection.coverDepth
+			hardCut = hardCut and not covered
+			local along = cum[bestIndex[key] or 1] or 0
+			if not shouldSpan and not covered and along >= wallOpts.clearStart and along <= totalLen - wallOpts.clearEnd then
+				local step = RoadCrossSection.wallStep(centerY, halfThick, walk, visNatural, vMode)
+				if step > 0 then hardCut = true elseif step < 0 then walledFill = true end
+			end
+		end
 		if not shouldSpan and not covered then
 			-- A CROSS-SECTION, not one flat shelf: the old single target dug the whole
 			-- footprint -- carriageway, footway and margin alike -- to one level 0.8 studs
@@ -332,7 +363,7 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 				-- the road hovering. The grade-limited shoulder below banks both into the ground.
 				gradedY = targetY
 			end
-			local myLock = if hardCut then cutLockHalf else lockHalf
+			local myLock = if hardCut then cutLockHalf elseif walledFill then wallInner else lockHalf
 			if d <= myLock then
 				led:write(ownerKey, gx, gz, worldYToRaw(gradedY), FLAG_LOCKED + FLAG_ROAD_GRADED)
 				-- +2 margin: boundary voxel columns interpolate between corners, so a
@@ -340,7 +371,7 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 				if gradedY < SEA_Y + 2 and naturalY >= SEA_Y then
 					dryKeys[#dryKeys + 1] = key
 				end
-			elseif not hardCut and math.abs(gradedY - naturalY) > 1e-3 then
+			elseif not hardCut and not walledFill and math.abs(gradedY - naturalY) > 1e-3 then
 				-- Shoulder widens with the height it must absorb so embankment/cut sides
 				-- never exceed MAX_GRADE (mirrors TerrainPadService's shoulder). The hard
 				-- open cut has NO shoulder: its bed jumps to natural in one corner span
@@ -406,11 +437,33 @@ local function gradeCenterline(ownerKey: string, pts: { Vector3 }, _minX: number
 end
 
 -- Grade the terrain under one segment. Idempotent per segment id.
+-- Arm count and widest road width at a node, for where walls start (wallNodeClear). Set by
+-- RoadService, which owns the network; nil until then (walls then keep clear of both ends).
+local _nodeInfo: ((nodeId: number) -> (number, number))? = nil
+function TerrainGradeService.setNodeInfo(fn: (nodeId: number) -> (number, number))
+	_nodeInfo = fn
+end
+
+local function nodeClear(nodeId: number, ownWidth: number): number
+	local arms, widest = 1, ownWidth
+	if _nodeInfo then
+		local ok, a, w = pcall(_nodeInfo, nodeId)
+		if ok and type(a) == "number" then
+			arms = a
+			widest = math.max(ownWidth, if type(w) == "number" then w else 0)
+		end
+	end
+	return RoadCrossSection.wallNodeClear(arms, widest)
+end
+
 function TerrainGradeService.gradeSegment(seg: any)
 	if seg.isArc then return end
 	local spec = RoadTypeCatalog.getOrDefault(seg.roadType)
 	local pts, minX, maxX, minZ, maxZ = sampleCenterline(seg)
-	gradeCenterline(ROAD_KIND .. "seg:" .. seg.id, pts, minX, maxX, minZ, maxZ, spec.width, seg.vMode == "Elevated", spec.terrainMaterialId, seg.vMode == "Tunnel", (if spec.noSidewalk then 0 else RoadConstants.SIDEWALK_WIDTH))
+	local wallOpts: WallOpts? = if RoadCrossSection.takesWalls(spec, seg)
+		then { vMode = seg.vMode, clearStart = nodeClear(seg.startNode, spec.width), clearEnd = nodeClear(seg.endNode, spec.width) }
+		else nil
+	gradeCenterline(ROAD_KIND .. "seg:" .. seg.id, pts, minX, maxX, minZ, maxZ, spec.width, seg.vMode == "Elevated", spec.terrainMaterialId, seg.vMode == "Tunnel", (if spec.noSidewalk then 0 else RoadConstants.SIDEWALK_WIDTH), wallOpts)
 end
 
 -- Grade the terrain under a render-only corner connector (the rounded road arc that
@@ -418,7 +471,9 @@ end
 -- footprint went ungraded -- on a steep bend the connector ramps down the slope while
 -- the ground stays at the node height, poking natural terrain up through the road.
 -- Keyed in a negative id space so it refcounts/restores independently of segments.
-function TerrainGradeService.gradeConnector(nodeId: number, p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, width: number, cutWalls: boolean?, walkWidth: number?)
+-- `wallVMode`: the bend carries the roads' retaining walls round it (a 2-arm node), built
+-- for this vertical mode; nil = no walls (a dead-end stub, or a bend between modes).
+function TerrainGradeService.gradeConnector(nodeId: number, p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, width: number, cutWalls: boolean?, walkWidth: number?, wallVMode: string?)
 	assert(type(nodeId) == "number", "[TerrainGradeService] gradeConnector expects a numeric nodeId")
 	local STEPS = 12
 	local pts = table.create(STEPS + 1)
@@ -433,7 +488,8 @@ function TerrainGradeService.gradeConnector(nodeId: number, p0: Vector3, p1: Vec
 	end
 	-- A rendered corner is still a ground road. Treating it as a bridge only cut
 	-- high terrain and left grass in any low seam where two roads joined.
-	gradeCenterline(ROAD_KIND .. "conn:" .. nodeId, pts, minX, maxX, minZ, maxZ, width, false, nil, cutWalls, walkWidth)
+	local wallOpts: WallOpts? = if wallVMode then { vMode = wallVMode, clearStart = 0, clearEnd = 0 } else nil
+	gradeCenterline(ROAD_KIND .. "conn:" .. nodeId, pts, minX, maxX, minZ, maxZ, width, false, nil, cutWalls, walkWidth, wallOpts)
 end
 
 function TerrainGradeService.ungradeConnector(nodeId: number)

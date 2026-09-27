@@ -36,6 +36,7 @@ test every change before it ships.
 | `t_signs.luau` | traffic sign plan (USA + Europe) on real junctions: which signs, off the carriageway, facing their traffic |
 | `reg.sh <mode> <outdir>` | the whole traffic suite above, 4 at a time (needs `CITY_LAB_PLACE`; `CITY_LAB_GAME` to test a frozen copy) |
 | `render_lab.luau <mode> <scene> <out.json>` then `python3 render/top.py out.json out.png cx cz half ppu` | top-down picture of what the road code builds |
+| `DUMP3D="cx,cz,half" lune run render_lab.luau <mode> <scene> out.json` then `python3 render/shade3d.py out.3d.json out.png cx cy cz dist yaw pitch` | angled 3D picture (depth-buffered, PIL only) of the terrain plus everything the road code built -- e.g. scene `walls`: retaining walls on a raised road, a lowered road and a tunnel ramp with its portal |
 | `specrun.luau <mode>` | the project's own `.spec` modules |
 | `zone_lab.luau <mode> <street\|streethill\|corner\|cornerhill> <out.json>` | zones a street (flat or 1-in-8 hill, straight or with a 90-degree bend) with the real Plot/Building/LotDressing services and the place's templates, waits for construction, then measures how far each lot's ground sits above or below its floor. `ROWS=1` lists every lot, `DIAG=1` dumps the worst lot's ground and terrain-ledger owners |
 | `t_earth.luau <mode> streethill x` | one construction site: staged earthworks (ground height per step), its utility badge, build time |

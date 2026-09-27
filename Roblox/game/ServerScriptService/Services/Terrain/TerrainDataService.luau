@@ -227,6 +227,28 @@ function TerrainDataService.getSurfaceY(worldX: number, worldZ: number): number
 	return _hm:getHeightAt(worldX, worldZ) + Constants.RENDER_BULGE
 end
 
+-- The visible surface the ground WOULD have with no roads or building pads on it: the
+-- overlay ledger's original heights, bilinear like getHeightAt. Retaining walls measure the
+-- step between a road and the land beside it from this, not from the graded ground (which
+-- the road itself has already cut or filled).
+function TerrainDataService.getNaturalSurfaceY(worldX: number, worldZ: number): number
+	if not _ledger then return TerrainDataService.getSurfaceY(worldX, worldZ) end
+	local maxCorner = Constants.CORNERS_PER_AXIS - 1
+	local fx = math.clamp(Constants.worldToCorner(worldX), 0, maxCorner)
+	local fz = math.clamp(Constants.worldToCorner(worldZ), 0, maxCorner)
+	local tx = math.min(math.floor(fx), maxCorner - 1)
+	local tz = math.min(math.floor(fz), maxCorner - 1)
+	local sx, sz = fx - tx, fz - tz
+	local toY = Constants.rawToWorldY
+	local h00 = toY(_ledger:naturalRaw(tx, tz))
+	local h10 = toY(_ledger:naturalRaw(tx + 1, tz))
+	local h01 = toY(_ledger:naturalRaw(tx, tz + 1))
+	local h11 = toY(_ledger:naturalRaw(tx + 1, tz + 1))
+	local top = h00 + (h10 - h00) * sx
+	local bot = h01 + (h11 - h01) * sx
+	return top + (bot - top) * sz + Constants.RENDER_BULGE
+end
+
 function TerrainDataService.getSlopeAt(worldX: number, worldZ: number): number
 	return _hm:getSlopeAt(worldX, worldZ)
 end
