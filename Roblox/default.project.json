@@ -1,25 +1,30 @@
 {
-  "name": "City District",
+  "name": "City Districts",
   "tree": {
     "$className": "DataModel",
 
+    "ReplicatedFirst": {
+      "$path": "game/ReplicatedFirst"
+    },
+
     "ReplicatedStorage": {
-      "Shared": {
-        "$path": "src/shared"
-      }
+      "$path": "game/ReplicatedStorage"
     },
 
     "ServerScriptService": {
-      "Server": {
-        "$path": "src/server"
-      }
+      "$path": "game/ServerScriptService"
+    },
+
+    "ServerStorage": {
+      "$path": "game/ServerStorage"
     },
 
     "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "$ignoreUnknownInstances": true,
+
       "StarterPlayerScripts": {
-        "Client": {
-          "$path": "src/client"
-        }
+        "$path": "game/StarterPlayer/StarterPlayerScripts"
       }
     }
   }

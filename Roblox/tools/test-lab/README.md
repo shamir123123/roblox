@@ -2,24 +2,21 @@
 
 Runs the game's real server scripts (roads, lane graph, traffic AI, citizens, economy) under
 Lune, outside Roblox, with a small stand-in for the Roblox API (`shim/studio.luau`). Used to
-test every fix in `../../pending-fixes/` before it ships.
+test every change before it ships.
 
 ## What you need
 
-- [Lune](https://github.com/lune-org/lune) 0.10+ (`lune run <script>`), Python 3 with Pillow for
-  the top-down renders, and optionally [selene](https://github.com/Kampfkarren/selene).
-- An extracted copy of the place's scripts (not committed; the scripts are your game):
-  `rojo syncback` of the place file into a folder, laid out as the lab expects:
-
-  ```
-  $CITY_LAB_DATA/dump/ReplicatedStorage, dump/ReplicatedFirst, dump/ServerScriptService,
-                 dump/ServerStorage, dump2/SPS   (StarterPlayerScripts)
-  $CITY_LAB_DATA/fix*/new/...                     (patched files per batch, see shim/setup.luau)
-  ```
-
-  Point `CITY_LAB_DATA` at that folder. `zone_lab.luau` and the scenarios built on it also load
-  the building templates and nature models as `.rbxm` files from
-  `dump/ServerStorage/Templates` and `dump/ReplicatedStorage/Nature` (`shim/models.luau` reads them).
+- [Lune](https://github.com/lune-org/lune) 0.10.5+ (`rokit install` in `Roblox/` gets it),
+  Python 3 with Pillow for the top-down renders, and optionally
+  [selene](https://github.com/Kampfkarren/selene).
+- The scripts come from this repo's `game/` tree. Run everything from `tools/test-lab`.
+- `CITY_LAB_PLACE` = path to the place file (`.rbxl`). The lab loads the models, vehicle
+  templates and other non-script assets from it; scripts inside it are ignored.
+- To compare against an older version, check it out somewhere
+  (`git worktree add /tmp/before <commit>`) and set `CITY_LAB_ORIG=/tmp/before/Roblox/game`;
+  mode `orig` then runs that tree.
+- `zone_lab.luau` and the scenarios built on it still read `.rbxm` folders from
+  `$CITY_LAB_DATA/dump/...` (a `rojo syncback` of the place).
 
 ## Main scenarios
 
@@ -41,5 +38,5 @@ test every fix in `../../pending-fixes/` before it ships.
 | `t_padbench.luau <mode>` | time to lay / bulldoze 400 building pads in a dense grid |
 | `render/view3d.py dump.json out.png cx cz [dist yaw pitch w h targetY]` | angled 3D render (Blender's `bpy` module, Cycles on the CPU) of a `zone_lab` dump plus its terrain |
 
-`<mode>`: `orig` = the place as sent; `fix4`, `fix5`, `fix6`, `fix7` = with the pending batches
-up to that one overlaid (see `shim/setup.luau`; `fix7` takes every file in `fix7/new`). Table iteration order is not deterministic, so run several seeds.
+`<mode>`: `orig` = the tree at `$CITY_LAB_ORIG`; anything else (e.g. `cur`) = this checkout's
+`game/`. Table iteration order is not deterministic, so run several seeds.

@@ -1,0 +1,56 @@
+--!strict
+return function()
+	local Quant = require(script.Parent)
+
+	describe("n", function()
+		it("rounds to one decimal", function()
+			expect(Quant.n(10.14159)).to.equal(10.1)
+			expect(Quant.n(-2.06)).to.equal(-2.1)
+			expect(Quant.n(5)).to.equal(5)
+		end)
+	end)
+
+	describe("deep", function()
+		it("rounds every nested number to one decimal", function()
+			local t = Quant.deep({ a = 1.239, b = { c = { 4.55, 6.02 } }, s = "keep" })
+			expect(t.a).to.equal(1.2)
+			expect(t.b.c[1]).to.equal(4.6)
+			expect(t.b.c[2]).to.equal(6)
+			expect(t.s).to.equal("keep")
+		end)
+	end)
+
+	describe("packPivot / unpackPivot", function()
+		it("packs to {x, y, z, yawDeg} with a whole-degree yaw", function()
+			local cf = CFrame.new(12.34, 5.67, -8.91) * CFrame.Angles(0, math.rad(45), 0)
+			local p = Quant.packPivot(cf)
+			expect(#p).to.equal(4)
+			expect(p[1]).to.equal(12.3)
+			expect(p[4]).to.equal(45)
+		end)
+
+		it("round-trips position and facing within tolerance", function()
+			local cf = CFrame.new(12.34, 5.67, -8.91) * CFrame.Angles(0, math.rad(45), 0)
+			local back = Quant.unpackPivot(Quant.packPivot(cf))
+			expect(back).to.be.ok()
+			expect((back.Position - Vector3.new(12.3, 5.7, -8.9)).Magnitude).to.be.near(0, 1e-4)
+			-- LookVector recovered from the whole-degree yaw (<= 0.5 deg error).
+			expect(back.LookVector:Dot(cf.LookVector)).to.be.near(1, 1e-3)
+		end)
+
+		it("reads an old 12-float CFrame array (back-compat)", function()
+			local cf = CFrame.new(3, 4, 5) * CFrame.Angles(0, math.rad(90), 0)
+			local old = { cf:GetComponents() }
+			local back = Quant.unpackPivot(old)
+			expect(back).to.be.ok()
+			expect((back.Position - Vector3.new(3, 4, 5)).Magnitude).to.be.near(0, 1e-4)
+			expect(back.LookVector:Dot(cf.LookVector)).to.be.near(1, 1e-4)
+		end)
+
+		it("returns nil for malformed input", function()
+			expect(Quant.unpackPivot(nil)).to.never.be.ok()
+			expect(Quant.unpackPivot({ 1, 2 })).to.never.be.ok()
+			expect(Quant.unpackPivot({ 1, 2, 3, "x" })).to.never.be.ok()
+		end)
+	end)
+end

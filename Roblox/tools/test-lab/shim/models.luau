@@ -1,6 +1,8 @@
--- Load the place's saved models (.rbxm, from `rojo syncback`) into the Studio stand-in:
--- folders become Folders, each .rbxm becomes its instances with the properties the city
--- code reads (geometry, colour, attributes, PrimaryPart). Scripts inside are skipped.
+-- Load the place's saved models into the Studio stand-in: folders become Folders, each model
+-- becomes its instances with the properties the city code reads (geometry, colour,
+-- attributes, PrimaryPart). Scripts inside are skipped. Call the result as
+-- mount(dir, parent) for a folder of .rbxm files, or use .mountPlace(file) to merge every
+-- non-script instance of a place file into the tree the scripts were mounted from.
 local fs = require("@lune/fs")
 local roblox = require("@lune/roblox")
 return function(Studio)
@@ -66,9 +68,37 @@ return function(Studio)
 			end
 		end
 	end
-	return function(dir: string, parent)
-		count = 0
-		mount(dir, parent)
-		return count
+	local SCRIPT = { Script = true, LocalScript = true, ModuleScript = true }
+	local function merge(src, parent)
+		for _, child in src:GetChildren() do
+			if SCRIPT[child.ClassName] then
+				local node = parent:FindFirstChild(child.Name)
+				if node then merge(child, node) end
+				continue
+			end
+			local node = parent:FindFirstChild(child.Name)
+			if node and child.ClassName == "Folder" then
+				merge(child, node)
+			elseif convert(child, parent) then
+				count += 1
+			end
+		end
 	end
+	local SERVICES = { "ReplicatedStorage", "ReplicatedFirst", "ServerStorage", "ServerScriptService" }
+	return setmetatable({
+		mountPlace = function(file: string)
+			count = 0
+			local place = roblox.deserializePlace(fs.readFile(file))
+			for _, name in SERVICES do
+				merge(place:GetService(name), Studio.game[name])
+			end
+			return count
+		end,
+	}, {
+		__call = function(_, dir: string, parent)
+			count = 0
+			mount(dir, parent)
+			return count
+		end,
+	})
 end
