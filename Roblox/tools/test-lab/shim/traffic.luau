@@ -7,10 +7,12 @@ function World.new(mode: string, opts: any?)
 	opts = opts or {}
 	local Studio = require("./setup")(mode)
 	Studio.expose("ServerScriptService.Services.NPC.NPCDriverService",
-		"NPCDriverService.__test = { queueLeader = getNearestQueueLeader, drivers = _drivers, edgeIndex = _edgeDriverIndex, laneChangeIndex = _laneChangeIndex, connIndex = _connectorByNextEdgeIndex, owesCourtesy = owesCourtesy, claimant = junctionClaimant, canEnter = canEnterIntersection, exitLaneHasRoom = exitLaneHasRoom, distToStopLine = distToStopLine, boxHasConflict = boxHasConflict, ringOf = ringOf, ringHasRoom = ringHasRoom }")
+		"NPCDriverService.__test = { queueLeader = getNearestQueueLeader, drivers = _drivers, edgeIndex = _edgeDriverIndex, laneChangeIndex = _laneChangeIndex, connIndex = _connectorByNextEdgeIndex, connFromIndex = _connectorByFromEdgeIndex, landIndex = _connByLandingNode, leaveIndex = _connByLeavingNode, owesCourtesy = owesCourtesy, claimant = junctionClaimant, canEnter = canEnterIntersection, exitLaneHasRoom = exitLaneHasRoom, distToStopLine = distToStopLine, boxHasConflict = boxHasConflict, ringOf = ringOf, ringHasRoom = ringHasRoom }")
 	Studio.expose("ServerScriptService.Services.Util.PathFollower",
 		"PathFollower.__test = { registry = _carRegistry, spatial = _spatial, poseOf = _poseOf, movedAt = _movedAt, npcIds = _npcIds, modelOfId = _modelOfId, lastSentTo = _lastSentTo, inRange = _inRange, prox = _proximityAccum, carHalf = _carHalf }")
 	local self = setmetatable({}, World)
+	-- opts.fnprof = { module paths }: per-function timing (shim/fnprof), attached by build().
+	if opts.fnprof then self.FP = require("./fnprof")(Studio, opts.fnprof) end
 	self.Studio = Studio
 	self.V = Studio.Vector3
 	self.CF = Studio.CFrame
@@ -56,6 +58,7 @@ function World:build(signals: boolean?)
 	end
 	self.Drivers.Start()
 	self.Studio.step(0.05)
+	if self.FP then self.FP.attach() end
 end
 
 -- A player whose camera hovers over `pos` (keeps nearby cars on the full-rate AI tier).

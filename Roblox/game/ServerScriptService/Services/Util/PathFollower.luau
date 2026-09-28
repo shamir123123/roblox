@@ -199,10 +199,14 @@ function PathFollower.getClearAhead(model: Model, pos: Vector3, dir: Vector3): (
 	local nearestGap = math.huge            -- bumper gap to it (centre dist minus both half-lengths)
 	local nearestDot: number? = nil
 	local nearestCar: Model? = nil
-	local minCellX = math.floor((pos.X - SCAN_DIST) / SPATIAL_CELL_SIZE)
-	local maxCellX = math.floor((pos.X + SCAN_DIST) / SPATIAL_CELL_SIZE)
-	local minCellZ = math.floor((pos.Z - SCAN_DIST) / SPATIAL_CELL_SIZE)
-	local maxCellZ = math.floor((pos.Z + SCAN_DIST) / SPATIAL_CELL_SIZE)
+	-- Only the cells the strip ahead can touch (SCAN_DIST long, a lane wide): the whole 3x3
+	-- block around the car was scanned before, over twice the candidates for the same answer.
+	local sideX, sideZ = math.abs(rightX) * LANE_HALF_WIDTH, math.abs(rightZ) * LANE_HALF_WIDTH
+	local tipX, tipZ = pos.X + flatDir.X * SCAN_DIST, pos.Z + flatDir.Z * SCAN_DIST
+	local minCellX = math.floor((math.min(pos.X, tipX) - sideX) / SPATIAL_CELL_SIZE)
+	local maxCellX = math.floor((math.max(pos.X, tipX) + sideX) / SPATIAL_CELL_SIZE)
+	local minCellZ = math.floor((math.min(pos.Z, tipZ) - sideZ) / SPATIAL_CELL_SIZE)
+	local maxCellZ = math.floor((math.max(pos.Z, tipZ) + sideZ) / SPATIAL_CELL_SIZE)
 	for cellX = minCellX, maxCellX do
 		local column = _spatial[cellX]
 		if not column then continue end
@@ -211,7 +215,7 @@ function PathFollower.getClearAhead(model: Model, pos: Vector3, dir: Vector3): (
 			if not bucket then continue end
 			for other in bucket do
 				local entry = _carRegistry[other]
-				if not entry or other == model or not other.Parent then continue end
+				if not entry or other == model then continue end
 				local dx = entry.pos.X - pos.X
 				local dz = entry.pos.Z - pos.Z
 				local ahead = dx * flatDir.X + dz * flatDir.Z
@@ -220,6 +224,8 @@ function PathFollower.getClearAhead(model: Model, pos: Vector3, dir: Vector3): (
 				-- Beyond the imminent-collision radius, only same-direction cars count.
 				local sameDir = entry.dir.X * flatDir.X + entry.dir.Z * flatDir.Z
 				if ahead > CLOSE_DIST and sameDir < HEADING_DOT then continue end
+				-- Last, the engine read: only for a car that would otherwise count.
+				if not other.Parent then continue end
 				nearestAhead = ahead
 				nearestGap = ahead - myHalf - entry.half
 				nearestDot = sameDir
@@ -416,6 +422,7 @@ local _flushScheduled = false
 --   <= FAR_DIST           2 Hz, 1 in 2, then 1 in 4     the skyline: a sample, never all
 -- NPCDriverView draws the same sample (the same id modulus), so what is not sent is not drawn.
 local FULL_RATE_DIST   = 300
+PathFollower.FULL_RATE_DIST = FULL_RATE_DIST -- viewers get every pose only this close
 local FULL_DETAIL_DIST = 1000
 local MID_SAMPLE_DIST  = 2000
 local FAR_DIST         = 4000
@@ -430,6 +437,34 @@ local function playerRefs(player: Player, out: { Vector3 })
 	if root then table.insert(out, root.Position) end
 	if _cameraPos[player] then table.insert(out, _cameraPos[player]) end
 	if _cameraFocus[player] then table.insert(out, _cameraFocus[player]) end
+end
+
+-- A vehicle further than every viewer's stream reach (FAR_DIST, plus slack for cameras on
+-- the move) is not queued for the stream at all: flushStream used to walk every moving car
+-- in the city for every player, 12 times a second, only to send most of them nothing. One
+-- still owed a farewell by a viewer who has it keeps being queued until that goes out. The
+-- verdict is re-taken every STREAM_SKIP_RECHECK per car.
+local STREAM_REACH = FAR_DIST + 300
+PathFollower.STREAM_REACH = STREAM_REACH -- past this from every viewer, a vehicle is seen by nobody
+local STREAM_SKIP_DIST_SQ = STREAM_REACH ^ 2
+local STREAM_SKIP_RECHECK = 0.3
+local _streamSkipUntil: { [Model]: number } = setmetatable({}, { __mode = "k" }) :: any
+local function streamRelevant(model: Model, pos: Vector3): boolean
+	local now = os.clock()
+	local skipUntil = _streamSkipUntil[model]
+	if skipUntil and now < skipUntil then return false end
+	if PathFollower.nearestPlayerDistSq(pos) <= STREAM_SKIP_DIST_SQ then
+		_streamSkipUntil[model] = nil
+		return true
+	end
+	local id = _npcIds[model]
+	if id then
+		for _, sent in _lastSentTo do
+			if sent[id] then return true end
+		end
+	end
+	_streamSkipUntil[model] = now + STREAM_SKIP_RECHECK
+	return false
 end
 
 -- Seconds between poses of vehicle `id` for a viewer `d2` (squared studs) away; nil = none.
@@ -598,8 +633,12 @@ function PathFollower.keepalive()
 	end
 	if now < _nextKeepalive then return end
 	_nextKeepalive = now + KEEPALIVE_DT
+	-- Cheap tests first, the engine read (Parent) last; and nothing for a vehicle no viewer
+	-- can see (streamRelevant) -- with thousands of parked and queued cars this sweep was a
+	-- burst of its own every KEEPALIVE_DT.
 	for model, cf in _poseOf do
-		if model.Parent and _npcIds[model] and now - (_movedAt[model] or 0) >= KEEPALIVE_DT then
+		if now - (_movedAt[model] or 0) >= KEEPALIVE_DT and _npcIds[model]
+			and streamRelevant(model, cf.Position) and model.Parent then
 			queueKeep(model, cf)
 		end
 	end
@@ -768,7 +807,11 @@ function PathFollower.place(state: FollowerState, pos: Vector3, dir: Vector3, dt
 	-- replicated spawn pose for the one stream interval before the first packet lands.
 	local root = model.PrimaryPart
 	if root and isStreamed(model) then
-		PathFollower.streamPose(model, finalCF)
+		if streamRelevant(model, finalCF.Position) then
+			PathFollower.streamPose(model, finalCF)
+		else
+			_movedAt[model] = os.clock() -- _poseOf is already current (above)
+		end
 	elseif root then
 		root.CFrame = finalCF
 	else

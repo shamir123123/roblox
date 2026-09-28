@@ -11,8 +11,12 @@ local T = tonumber(process.args[3]) or 120
 local N = tonumber(process.args[4]) or 6
 local far = process.args[5] == "far"
 local S = 300
+local SPAWNS_PER_FRAME = tonumber(process.env.SPF) or 6
 
-local w = World.new(mode)
+local w = World.new(mode, { fnprof = if process.env.FP == "1" then {
+	"ServerScriptService.Services.NPC.NPCDriverService", "ServerScriptService.Services.Util.PathFollower",
+	"ServerScriptService.Services.Traffic.TrafficSignalService",
+} else nil })
 local V = w.V
 -- the real clock, for an instrumented tree (the modules' own os.clock is the lab's virtual one)
 w.Studio.env(w.Studio.find("ServerScriptService.Services.NPC.NPCDriverService")).shared.CLOCK = os.clock
@@ -59,8 +63,8 @@ while t < T do
 	for _, rec in w.cars do
 		if not rec.arrived and not rec.aborted then live += 1 end
 	end
-	-- keep the city topped up, a few spawns per frame
-	for _ = 1, 6 do
+	-- keep the city topped up, a few spawns per frame (SPF=n for big fills)
+	for _ = 1, SPAWNS_PER_FRAME do
 		if live >= CARS then break end
 		local a, b = randomRoadPoint(), randomRoadPoint()
 		if (a - b).Magnitude > 400 and w.Drivers.IsPointClear(a, 12) then
@@ -113,6 +117,28 @@ if process.env.DUMP_BLOCKED then
 	end
 end
 if #w.Studio.errors > 0 then print(w.Studio.errors[1]:sub(1, 600)) end
+if w.FP then w.FP.report(tonumber(process.env.FPN) or 45) end
+-- Lane-index consistency: every entry a live car, each car filed once per key, and exactly
+-- the filings it records (state.ix) -- a stale or duplicate entry would pile up for ever.
+do
+	local T = w.Drivers.__test
+	local entries, stale, dup, expected = 0, 0, 0, 0
+	for _, index in { T.edgeIndex, T.laneChangeIndex, T.connIndex, T.connFromIndex, T.landIndex, T.leaveIndex } do
+		for _, bucket in index or {} do
+			local seen = {}
+			for _, st in bucket do
+				entries += 1
+				if T.drivers[st.model] ~= st then stale += 1 end
+				if seen[st] then dup += 1 end
+				seen[st] = true
+			end
+		end
+	end
+	for _, st in T.drivers do
+		if st.ix then expected += #st.ix.list // 2 end
+	end
+	print(("INDEX entries %d expected %d stale %d duplicate %d"):format(entries, expected, stale, dup))
+end
 -- An instrumented tree (see README) leaves inclusive seconds per function in shared.PROF.
 local env = w.Studio.env(w.Studio.find("ServerScriptService.Services.NPC.NPCDriverService"))
 local prof = env.shared and env.shared.PROF

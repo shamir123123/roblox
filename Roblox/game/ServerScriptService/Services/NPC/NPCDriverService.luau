@@ -59,6 +59,28 @@ local FAR_LOD_DIST_SQ  = FAR_LOD_DIST * FAR_LOD_DIST
 local FAR_TICK         = 1 / 4  -- s between far-car updates
 local FAR_MAX_DT       = 0.3    -- longest step a far car integrates in one go
 local LOD_RECHECK      = 1      -- s between a car's near/far re-evaluations
+-- Past every viewer's pose stream (PathFollower.STREAM_REACH) a car is seen by nobody at all:
+-- it thinks twice a second. Big steps are safe -- every move is clamped to the gap to the car
+-- ahead, the clearance in front and the stop line, and a step that would cross a line asks
+-- for right of way first -- so a distant queue, signal or jam still runs for real, just
+-- coarser. With thousands of cars most of them are here, and this is what they cost. The
+-- price: a queued car only sees its leader pull away on its own next step, so every place in
+-- a queue starts up to one step late -- measured, a junction nobody can see lets through
+-- about a fifth fewer cars at 2 Hz (a third fewer at 1 Hz, which is why it is not slower).
+local DISTANT_LOD_DIST_SQ = PathFollower.STREAM_REACH * PathFollower.STREAM_REACH
+-- Between the full-rate stream band (PathFollower.FULL_RATE_DIST) and FAR_LOD_DIST a viewer
+-- is sent a car's pose 4 times a second at most, so thinking 20 times a second there bought
+-- nothing anyone sees: 10 Hz, still well above what the stream shows.
+local NEAR_LOD_DIST_SQ = PathFollower.FULL_RATE_DIST * PathFollower.FULL_RATE_DIST
+local MID_TICK         = 0.1
+local MID_MAX_DT       = 0.15
+local DISTANT_TICK     = 0.5    -- s between distant-car updates
+local DISTANT_MAX_DT   = 0.5    -- longest step a distant car integrates in one go
+-- No cap on how many far cars one tick may update: a cap that binds leaves the cars it
+-- defers standing wherever they are -- inside junction boxes too -- and the cross traffic
+-- piles up behind them (measured at 3000 cars: ~30% more cars stopped, about half the trips done).
+-- The load is spread by the random first phase below instead.
+local SWEEP_EVERY_TICKS = 5 -- destroyed-car sweep (see the tick loop)
 local EXIT_CLEARANCE    = 12 * WS  -- reduced from 30; was causing exit-lane deadlocks
 local STOP_DECEL_DISTANCE = 5 * WS
 local STOP_LINE_CAR_BUFFER = 3 * WS
@@ -148,6 +170,7 @@ local _lastCongestionUpdate = 0
 type LaneChange = { pts: { Vector3 }, from: string, to: string, d0: number, d1: number }
 
 type DriverState = PathFollower.FollowerState & {
+	ix:            any?, -- where this car is filed in the lane indexes (see reindexDriver)
 	edgeId:        string,
 	edgeDist:      number,
 	graphVersion: number,
@@ -198,6 +221,8 @@ type DriverState = PathFollower.FollowerState & {
 	laneChangeWait: number?,    -- seconds held at the end of a lane-change window with no gap
 	laneChangeMissed: string?,  -- lane edge whose window this car overran at speed and re-planned from
 	lodFar: boolean?,           -- far from every player: thinks at FAR_TICK (see FAR_LOD_DIST)
+	lodDistant: boolean?,       -- past every viewer's pose stream: thinks at DISTANT_TICK
+	lodMid: boolean?,           -- inside FAR_LOD_DIST but past the full-rate stream band: MID_TICK
 	lodAccum: number?,          -- sim time banked since this car last thought
 	lodCheckAt: number?,        -- os.clock of the next near/far re-evaluation
 	blockerDot: number?,        -- heading agreement with whatever blocks us (1 = queued behind it)
@@ -220,6 +245,8 @@ local _unseated: { [Model]: any } = setmetatable({}, { __mode = "k" }) :: any
 -- MEMORY LEAK FIX: We make _drivers a WEAK-KEYED table so that when an NPC model is 
 -- destroyed, its driver state is auto-garbage-collected, preventing a slow memory leak.
 local _drivers: { [Model]: DriverState } = setmetatable({}, { __mode = "k" }) :: any
+-- Cars that joined the pool since the last tick, filed into the lane indexes at its start.
+local _joined: { any } = {}
 -- Simulated seconds since the service started (advances once per driver tick, times game speed).
 local _simClock = 0
 local _nextDebugId = 0
@@ -370,35 +397,77 @@ local function addToIndex(index: { [any]: { any } }, key: any, state: DriverStat
 	table.insert(bucket, state)
 end
 
--- File a car that is on a connector under the junction nodes it is crossing.
-local function indexConnectorNodes(g: any, state: DriverState)
-	local nextEdge = state.nextEdgeId and g:GetEdge(state.nextEdgeId)
-	if nextEdge then addToIndex(_connByLandingNode, nextEdge.fromNode, state) end
-	local fromEdge = g:GetEdge(state.edgeId)
-	if fromEdge then addToIndex(_connByLeavingNode, fromEdge.toNode, state) end
+-- The lane indexes are kept up to date car by car instead of being rebuilt from every car
+-- every tick. A car's filing only changes when the car itself moves on -- onto a connector,
+-- a new lane, a lane change -- and that only happens in its own update, so it is re-filed
+-- right after that update (and when it joins or leaves the pool). A far car thinking at 4 Hz
+-- now costs the index nothing on the ticks it sits out; the full rebuild, every car on
+-- every tick, was the largest cost that grew with the car count and ignored the LOD.
+local function unindexDriver(state: DriverState)
+	local ix = state.ix
+	if not ix then return end
+	state.ix = nil
+	if ix.v ~= _indexGraphVersion then return end -- the indexes were dropped since
+	local list = ix.list
+	for i = 1, #list, 2 do
+		local bucket = list[i][list[i + 1]]
+		if bucket then
+			local at = table.find(bucket, state)
+			if at then table.remove(bucket, at) end
+		end
+	end
 end
 
+local function reindexDriver(state: DriverState)
+	local conn = state.connector ~= nil and state.nextEdgeId ~= nil
+	local lc = if conn then laneChangeOf(state) else nil
+	local lcFrom = if lc then lc.from else nil
+	local lcTo = if lc then lc.to else nil
+	local nextId = if conn then state.nextEdgeId else nil
+	local merge = if conn then nil else state.mergeInto
+	local ix = state.ix
+	if ix and ix.v == _indexGraphVersion and ix.conn == conn and ix.e == state.edgeId and ix.n == nextId
+		and ix.f == lcFrom and ix.t == lcTo and ix.m == merge then
+		return
+	end
+	unindexDriver(state)
+	if not state.model.Parent then return end
+	local list = {}
+	local function add(index: { [any]: { any } }, key: any)
+		if key == nil then return end
+		addToIndex(index, key, state)
+		list[#list + 1] = index
+		list[#list + 1] = key
+	end
+	if conn then
+		add(_connectorByNextEdgeIndex, nextId)
+		local g = nav()
+		if g then
+			local nextEdge = g:GetEdge(nextId)
+			if nextEdge then add(_connByLandingNode, nextEdge.fromNode) end
+			local fromEdge = g:GetEdge(state.edgeId)
+			if fromEdge then add(_connByLeavingNode, fromEdge.toNode) end
+		end
+		if lc then
+			add(_laneChangeIndex, lcFrom)
+			add(_laneChangeIndex, lcTo)
+		else
+			add(_connectorByFromEdgeIndex, state.edgeId)
+		end
+	else
+		add(_edgeDriverIndex, state.edgeId)
+		add(_laneChangeIndex, merge)
+	end
+	state.ix = { v = _indexGraphVersion, conn = conn, e = state.edgeId, n = nextId, f = lcFrom, t = lcTo, m = merge, list = list }
+end
+
+-- Full rebuild: only when the road graph changed (edge ids may have), and at start-up.
 local function rebuildDriverIndexes()
 	local g = nav()
 	clearDriverIndexes(if g then g:Version() else -1)
 	for _, other in pairs(_drivers) do
-		if not other.model.Parent then continue end
-		if other.connector and other.nextEdgeId then
-			addToIndex(_connectorByNextEdgeIndex, other.nextEdgeId, other)
-			if g then indexConnectorNodes(g, other) end
-			local lc = laneChangeOf(other)
-			if lc then
-				addToIndex(_laneChangeIndex, lc.from, other)
-				addToIndex(_laneChangeIndex, lc.to, other)
-			else
-				addToIndex(_connectorByFromEdgeIndex, other.edgeId, other)
-			end
-		else
-			addToIndex(_edgeDriverIndex, other.edgeId, other)
-			if other.mergeInto then
-				addToIndex(_laneChangeIndex, other.mergeInto, other)
-			end
-		end
+		other.ix = nil
+		reindexDriver(other)
 	end
 end
 
@@ -1382,8 +1451,9 @@ local function startConnector(
 	state.nextEdgeId   = nextId
 	state.nextEdgeDist = resumeDist
 	state.pendingNextEdgeId = nil
-	local g = nav()
-	if g then indexConnectorNodes(g, state) end
+	-- Filed under its junction straight away (tracked, see reindexDriver), so the cars
+	-- updating after it this tick already see it in the box.
+	reindexDriver(state)
 end
 
 local function buildUTurnArc(fromEdge: any, toEdge: any): { Vector3 }
@@ -1453,6 +1523,7 @@ end
 local function despawnDriver(state: DriverState)
 	local model = state.model
 	releaseBooking(state)
+	unindexDriver(state)
 	_drivers[model] = nil
 	PathFollower.forget(model)
 	model:Destroy()
@@ -1468,6 +1539,7 @@ local function abortDirected(state: DriverState)
 	state.route = nil
 	state.onArrive = nil
 	state.onAbort = nil
+	unindexDriver(state)
 	_drivers[state.model] = nil
 	PathFollower.forget(state.model)
 	if cb then task.spawn(cb) end
@@ -1726,18 +1798,20 @@ end
 -- name so exactly one of a pair waits.
 local function queueScan(bucket: { any }?, state: DriverState, laneId: string, myPos: number,
 	onlyConnectors: boolean, nearest: DriverState?, nearestGap: number): (DriverState?, number)
-	for _, other in bucket or {} do
-		if other == state or not other.model.Parent then continue end
+	for _, other in bucket or EMPTY do
+		if other == state then continue end
 		if onlyConnectors then
 			if not other.connector then continue end
 		elseif other.connector and not laneChangeOf(other) then
 			continue -- turned off this lane since the index was built
 		end
 		local rawGap = lanePos(other, laneId) - myPos
+		if rawGap < -QUEUE_TIE_EPSILON or math.max(0, rawGap) >= nearestGap then continue end
 		local tied = math.abs(rawGap) <= QUEUE_TIE_EPSILON and goesFirst(other, state)
 		if rawGap > QUEUE_TIE_EPSILON or tied then
 			local gap = math.max(0, rawGap)
-			if gap < nearestGap then
+			-- The engine read last, only for a car that would become the nearest.
+			if gap < nearestGap and other.model.Parent then
 				nearestGap = gap
 				nearest = other
 			end
@@ -2916,6 +2990,7 @@ local function updateDriver(state: DriverState, dt: number)
 				-- Trip over: hand the corridor back so it stops deterring other drivers.
 				releaseBooking(state)
 				clearDirectedDebugTag(state)
+				unindexDriver(state)
 				_drivers[state.model] = nil
 				-- Near cars move on the pose stream, not the instance, so leave the model
 				-- standing where it actually stopped: the owner's next leg starts from here.
@@ -3122,7 +3197,10 @@ local function trySpawn(): boolean
 	-- separate folder and must keep their state so their onArrive/onAbort contract holds
 	-- (a bare table.clear froze them mid-trip and leaked the directed-car count).
 	for model, state in pairs(_drivers) do
-		if not state.route then _drivers[model] = nil end
+		if not state.route then
+			unindexDriver(state)
+			_drivers[model] = nil
+		end
 	end
 	PathFollower.flushCache()
 
@@ -3212,6 +3290,7 @@ local function trySpawn(): boolean
 		}
 		_drivers[car] = state
 		_unseated[car] = state
+		table.insert(_joined, state)
 
 		local cum: { number } = table.create(#pts, 0)
 		cum[1] = 0
@@ -3321,6 +3400,7 @@ function NPCDriverService.DriveDirected(model: Model, startPos: Vector3, goalPos
 	}
 	_drivers[model] = state
 	_unseated[model] = state
+	table.insert(_joined, state)
 	-- Stake this route out so every driver planning after us can see it is taken.
 	bookRoute(state)
 	tagCarInfo(state, "Directed", route[1])
@@ -3465,6 +3545,7 @@ function NPCDriverService.ReleaseDirected(model: Model): boolean
 	if state and state.route then
 		releaseBooking(state)
 		clearDirectedDebugTag(state)
+		unindexDriver(state)
 		_drivers[model] = nil
 		PathFollower.forget(model)
 		return true
@@ -4100,6 +4181,7 @@ function NPCDriverService.Start()
 	_spawnedOnce = trySpawn()
 
 	local tickAccum = 0
+	local sweepIn = 0
 	_heartbeat = RunService.Heartbeat:Connect(function(dt: number)
 		tickAccum += math.min(dt, MAX_SIM_DT)
 		if tickAccum < DRIVER_TICK then return end
@@ -4114,35 +4196,67 @@ function NPCDriverService.Start()
 			return
 		end
 
-		-- Every car runs at the full DRIVER_TICK rate. The old 4 Hz off-screen tier saved
-		-- AI work but moved distant cars in 0.25 s lurches, which was visible from well
-		-- outside the 200-stud bubble. DRIVER_TICK is the knob if this ever costs frames.
+		-- Level of detail by distance to the nearest viewer (see FAR_LOD_DIST and below):
+		-- within the full-rate stream band every tick (DRIVER_TICK), out to FAR_LOD_DIST at
+		-- MID_TICK, out to the stream's reach at FAR_TICK, and past it at DISTANT_TICK.
 		local speed = math.clamp(math.floor(tonumber(workspace:GetAttribute("GameSpeed")) or 1), 0, 3)
 
-		for model, state in pairs(_drivers) do
-			if not model.Parent then
-				releaseBooking(state)
-				_drivers[model] = nil
-				PathFollower.forget(model)
+		-- Cars destroyed from outside (not through despawn/abort, which clean up at once) are
+		-- swept out a few times a second, not every tick: at ten thousand cars the sweep's
+		-- engine reads (model.Parent) were a cost of their own. A car updating checks its
+		-- own model anyway, and every scan re-checks the one car it picks.
+		sweepIn -= 1
+		if sweepIn <= 0 then
+			sweepIn = SWEEP_EVERY_TICKS
+			for model, state in pairs(_drivers) do
+				if not model.Parent then
+					releaseBooking(state)
+					unindexDriver(state)
+					_drivers[model] = nil
+					PathFollower.forget(model)
+				end
 			end
+		end
+		for _, state in _joined do
+			if _drivers[state.model] == state and not state.ix then reindexDriver(state) end
+		end
+		table.clear(_joined)
+		-- Road edits change edge ids: file every car afresh. Otherwise the indexes are kept
+		-- up to date car by car (reindexDriver).
+		do
+			local g0 = nav()
+			if (if g0 then g0:Version() else -1) ~= _indexGraphVersion then rebuildDriverIndexes() end
 		end
 
 		local tickStart = os.clock()
 		for _ = 1, speed do
 			_simClock += simDt
 			RerouteBudget.tokens = math.min(RerouteBudget.BURST, RerouteBudget.tokens + simDt * RerouteBudget.RATE)
-			rebuildDriverIndexes()
 			local g = nav()
 			if g then publishCongestionSnapshot(g) end
 			for model, state in pairs(_drivers) do
-				if not model.Parent then continue end
 				if tickStart >= (state.lodCheckAt or 0) then
 					state.lodCheckAt = tickStart + LOD_RECHECK * (0.75 + math.random() * 0.5)
-					state.lodFar = PathFollower.nearestPlayerDistSq(getStatePosition(state)) > FAR_LOD_DIST_SQ
+					local d2 = PathFollower.nearestPlayerDistSq(getStatePosition(state))
+					state.lodFar = d2 > FAR_LOD_DIST_SQ
+					state.lodDistant = d2 > DISTANT_LOD_DIST_SQ
+					state.lodMid = not state.lodFar and d2 > NEAR_LOD_DIST_SQ
 				end
-				state.lodAccum = (state.lodAccum or 0) + simDt
-				if state.lodFar and state.lodAccum < FAR_TICK then continue end
-				local stepDt = math.min(state.lodAccum, FAR_MAX_DT)
+				-- A random first phase, so cars spawned together (a load, a road edit) do not
+				-- all take their far/distant steps on the same tick.
+				state.lodAccum = (state.lodAccum or math.random() * DISTANT_TICK) + simDt
+				local maxDt = FAR_MAX_DT
+				if state.lodFar then
+					local every = if state.lodDistant then DISTANT_TICK else FAR_TICK
+					if state.lodAccum < every then continue end
+					if state.lodDistant then maxDt = DISTANT_MAX_DT end
+				elseif state.lodMid then
+					if state.lodAccum < MID_TICK - 1e-6 then continue end
+					maxDt = MID_MAX_DT
+				end
+				-- Only a car about to think pays the engine read (the sweep catches the rest).
+				if not model.Parent then continue end
+				local stepDt = math.min(state.lodAccum, maxDt)
 				state.lodAccum = 0
 
 				if despawnAtConnection(model, state) then
@@ -4161,6 +4275,9 @@ function NPCDriverService.Start()
 				else
 					updateDriver(state, stepDt)
 					if model.Parent then stallWatchdog(state, stepDt) end
+					-- Re-filed straight away (a no-op unless it changed lane or connector),
+					-- so the cars updating after it this tick already see where it went.
+					if _drivers[model] == state then reindexDriver(state) end
 				end
 			end
 		end
